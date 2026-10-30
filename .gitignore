@@ -1,0 +1,29 @@
+# Môi trường
+.venv/
+.venv-cvtest/
+__pycache__/
+*.pyc
+
+# Dữ liệu cục bộ (chứa key / nội dung người dùng)
+data/settings.json
+data/settings.json.tmp
+data/server.log*
+data/usage.jsonl
+data/last_job_id
+data/jobs/
+data/backups/
+data/install.log
+
+# Test: thư mục tạm và sản phẩm sinh ra
+data/test/tmp_*/
+data/test/out_acceptance/
+data/test/diag_*/
+data/test/debug/
+data/test/shots/
+data/test/*.mp4
+data/test/*.mkv
+data/test/crops*/
+
+# Font bản quyền
+data/test/*.ttf
+data/test/*.ttc
