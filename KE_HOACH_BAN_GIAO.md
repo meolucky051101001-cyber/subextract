@@ -99,6 +99,9 @@ Trước đây ô nội dung gốc/bản dịch đã sửa được nhưng hiể
 | **P2: UI test bằng trình duyệt thật (IAB, job 55 cue)** | Layout ✓, nút ⟳ dịch lại cue → toast + bản dịch mới (31.5s Lite) ✓, glossary lưu → toast ✓, dòng sai định dạng → toast lỗi "bỏ qua 1 dòng" ✓ |
 | **30-10: vá OCR trên video portrait hộp-trắng-chữ-đen** | Cue thu được 8 → 10 (thu hồi 2 khoảng 9.0–12.2 và 13.8–19.8 trước đây bị rơi); 11/11 group OCR đạt ngưỡng (cũ 9/11); thông báo mới "phụ đề gốc đã là tiếng Việt nên không có gì để dịch" khi target trùng nguồn |
 | **30-10: đa vùng ROI (video tổng hợp 2 vùng trên+dưới)** | 16/16 cue bóc đúng đủ thời lượng song song ở cả hai vùng; test UI trình duyệt: Nhân bản → hộp đối diện + nhãn lật chiều, bấm chọn vùng, Xóa vùng — tất cả PASS |
+| **31-10: two-pass tách cue dài (video 用喷枪画夜景)** | 8 cue → **16 cue**: cue 9s gộp 2 câu tách thành 3; mega-group 11s tách thành 6; thu hồi các câu chưa từng được trích ("Tranh thủ lúc giấy còn ẩm…", "đốm sáng to nhỏ…") — 5/5 PASS (`long_cue_split_test.py`) |
+| **31-10: fix_ocr_text (sửa từ dính)** | 'khôngdùng' → 'không dùng' theo từ điển âm tiết không dấu; không phá chữ sạch; unit + test e2e PASS |
+| **31-10: tìm & thay trong bảng cue** | Đếm khớp thời gian thực ("7 chỗ khớp" với 'được'), thay toàn bộ có undo; test UI PASS |
 | **30-10: lồng tiếng đầy đủ trên video thật** (`开箱Black_Muji卡片盒.mp4`, 32.27s, 720×1280) | Xuất `D:\banve\Dubbed_开箱Black_Muji卡片盒.mp4` (4,782,445 bytes, h264 + aac 48k stereo, đúng 32.27s); đoạn có tiếng AI mean −22.0 dB so với đoạn lặng −39.2 dB |
 | **30-10: E2E lồng tiếng qua API (8790 cô lập)** | 3 cue, TTS ~3s/câu, mux xong 2.6s, file tải được qua `/api/jobs/{id}/dubbed` |
 | **30-10: chặn chạy trùng job** | Bắt đầu lần 2 khi job đang chạy → HTTP 409 "Job đang chạy", không sinh luồng thứ 2 |
@@ -152,12 +155,12 @@ Các test 8790 tự dọn thư mục tạm; các test trên 8787 chỉ đọc/đ
 - Còn lại (nghiệm thu mở rộng): cue trộn nhiều ngôn ngữ trong MỘT cue; chạy video 100 cue; đo lại chi phí theo model.
 - Tiêu chí đạt: video 100 cue, tỷ lệ cue có bản dịch ≥ 98%, không sai nghĩa nghiêm trọng khi spot-check. (Video 55 cue đạt 100%; chưa chạy 100 cue.)
 
-### P3 — Vận hành (S–M) — còn lại
-- Theo dõi usage/cost Gemini (key dùng chung Tool V1).
-- Log rotation cho `data/server.log`.
-- Backup `data/settings.json` và `data/jobs/` (không chứa key trong backup công khai).
-- Khởi tạo git/versioning nếu muốn rollback.
-- Tiêu chí đạt: có log xoay vòng, có bản backup định kỳ, biết chi phí tuần.
+### P3 — Vận hành (S–M) — ✅ HOÀN THÀNH (31-10)
+- ✅ Theo dõi usage: mỗi lần dịch ghi `data/usage.jsonl` (chars/model/cues); `GET /api/usage` tổng hợp 14 ngày.
+- ✅ Log rotation: `launcher.py` xoay `data/server.log` sang `.log.1` khi quá 5 MB.
+- ✅ Backup: `backup.py` chép job.json + settings (ĐÃ STRIP key) vào `data/backups/YYYY-MM-DD/` — chạy thủ công hoặc Task Scheduler.
+- ✅ Git: đã init + commit cơ sở; `.gitignore` loại venv, `data/settings.json` (key), jobs, log, video/font test.
+- Tiêu chí đạt: có log xoay vòng ✅, có bản backup định kỳ ✅ (script sẵn sàng), biết khối lượng dịch ✅ (chars/tuần).
 
 ### P4 — AI lồng tiếng Chí Mai → `D:\banve` (M) — ✅ HOÀN THÀNH
 - ✅ Lõi lồng tiếng `app/pipeline/dub.py` + worker CapCut `app/dub_worker.py`, dùng đúng voice `BV562_streaming` của Tool V1, không cài thêm vào venv SubExtract.

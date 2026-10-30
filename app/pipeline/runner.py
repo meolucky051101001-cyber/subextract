@@ -66,10 +66,14 @@ def _add_best(group: _Group, sharp: float, t: float, frame: np.ndarray) -> None:
 
 def _add_spread(group: _Group, t: float, frame: np.ndarray) -> None:
     # Khung phủ đều theo thời gian: dùng cho cue dài để phát hiện chữ đổi
-    # khi hộp phụ đề giữ nguyên (phụ đề dạng hộp mờ).
-    if not group.spread or t - group.spread[-1][0] >= 1.0:
-        if len(group.spread) < 8:
-            group.spread.append((t, frame.copy()))
+    # khi hộp phụ đề giữ nguyên. Bước giãn thích ứng (1s → 2s → 3s) để group
+    # dài vẫn được phủ tới cuối mà không tốn quá nhiều bộ nhớ.
+    count = len(group.spread)
+    if count >= 24:
+        return
+    step = 1.0 if count < 8 else (2.0 if count < 16 else 3.0)
+    if not group.spread or t - group.spread[-1][0] >= step:
+        group.spread.append((t, frame.copy()))
 
 
 def _same_text(a: tuple, b: tuple) -> bool:
@@ -306,7 +310,7 @@ def run_pipeline(
             if long_cue:
                 # Cue dài: OCR đủ các khung phủ thời gian rồi tách theo lúc chữ đổi.
                 candidates.sort(key=lambda c: c.get("t", 0.0))
-                candidates = candidates[:8]
+                candidates = candidates[:16]
             else:
                 candidates = candidates[:4]
             reads: list[tuple[float, list[dict], float]] = []
