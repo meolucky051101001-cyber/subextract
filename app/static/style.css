@@ -448,8 +448,14 @@ input[type="range"] { padding: 0; background: transparent; border: none; accent-
 }
 .key-row input[type="password"]:focus { border-color: rgba(34, 211, 238, 0.45); }
 .gemini-box select { font-size: 12.5px; padding: 7px 9px; }
+.model-row { display: flex; gap: 8px; align-items: center; }
+.model-row select { flex: 1; min-width: 0; }
+#checkGeminiBtn { flex: 0 0 auto; white-space: nowrap; }
+.model-row select option.bad { color: #fda4af; }
 #geminiState.ok { color: #86efac; }
 #geminiState.bad { color: #fda4af; }
+#toolV1State.ok { color: #86efac; }
+#toolV1State.bad { color: #fda4af; }
 
 .gloss-label { margin: 10px 0 2px; font-size: 12px; font-weight: 600; color: var(--muted); }
 #glossaryInput {
@@ -501,6 +507,37 @@ input[type="range"] { padding: 0; background: transparent; border: none; accent-
   background: linear-gradient(90deg, var(--accent), var(--accent-2));
   transition: width .3s ease;
 }
+
+/* ---------- handoff sang Tool V1 ---------- */
+.btn.toolv1 {
+  background: rgba(129, 140, 248, 0.12);
+  border-color: rgba(129, 140, 248, 0.4);
+  color: #c7d2fe;
+}
+.btn.toolv1:hover { background: rgba(129, 140, 248, 0.2); }
+.btn.toolv1[disabled] { opacity: .45; cursor: not-allowed; }
+
+.handoff {
+  margin: 4px 0 14px;
+  padding: 12px 14px;
+  border: 1px solid rgba(129, 140, 248, 0.32);
+  border-radius: 12px;
+  background: rgba(129, 140, 248, 0.06);
+}
+.handoff-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+.handoff-head #handoffPct { margin-left: auto; }
+.handoff.ok { border-color: rgba(52, 211, 153, 0.4); background: rgba(52, 211, 153, 0.07); }
+.handoff.bad { border-color: rgba(251, 113, 133, 0.4); background: rgba(251, 113, 133, 0.07); }
+.handoff .bar { margin-bottom: 8px; }
+#handoffOut { color: var(--muted); word-break: break-all; }
 
 #progressMsg { margin-top: 8px; min-height: 17px; }
 #statsLine { margin-top: 4px; }

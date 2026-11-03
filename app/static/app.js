@@ -38,6 +38,7 @@ const els = {
   glossaryInput: $("#glossaryInput"),
   geminiState: $("#geminiState"),
   saveKeyBtn: $("#saveKeyBtn"),
+  checkGeminiBtn: $("#checkGeminiBtn"),
   fpsSelect: $("#fpsSelect"),
   confRange: $("#confRange"),
   confVal: $("#confVal"),
@@ -63,6 +64,18 @@ const els = {
   dubResult: $("#dubResult"),
   dubEnabled: $("#dubEnabled"),
   dubHint: $("#dubHint"),
+  toolV1Url: $("#toolV1Url"),
+  saveToolV1Btn: $("#saveToolV1Btn"),
+  toolV1State: $("#toolV1State"),
+  handoffBtn: $("#handoffBtn"),
+  handoffPanel: $("#handoffPanel"),
+  handoffStage: $("#handoffStage"),
+  handoffPct: $("#handoffPct"),
+  handoffBar: $("#handoffBar"),
+  handoffNote: $("#handoffNote"),
+  handoffOut: $("#handoffOut"),
+  handoffCancelBtn: $("#handoffCancelBtn"),
+  handoffCloseBtn: $("#handoffCloseBtn"),
   cueList: $("#cueList"),
   findInput: $("#findInput"),
   replaceInput: $("#replaceInput"),
@@ -110,8 +123,14 @@ const state = {
   uploading: false,
   geminiConfigured: false,
   translateModel: "",
+  modelStatus: null,
   dubOutputDir: "D:\\banve",
   dubVoiceLabel: "Chí Mai",
+  toolV1Url: "http://127.0.0.1:8088",
+  handoff: null,
+  handoffTimer: null,
+  handoffSending: false,
+  handoffFails: 0,
   showTrans: false,
   untranslated: [],
   retranslating: false,
@@ -201,6 +220,70 @@ function setGeminiState(text, tone = "") {
   els.geminiState.className = `small muted ${tone}`.trim();
 }
 
+const MODEL_STATUS_TEXT = {
+  quota: "hết hạn mức",
+  unavailable: "đang quá tải",
+  unreachable: "không kết nối được",
+  not_found: "không có trong tài khoản",
+  auth: "key không dùng được",
+  no_key: "chưa có key",
+};
+
+function modelStatusText(item) {
+  return MODEL_STATUS_TEXT[item.reason] || "không dùng được";
+}
+
+function applyModelStatus(data) {
+  state.modelStatus = data;
+  const byId = {};
+  (data.models || []).forEach((item) => { byId[item.id] = item; });
+  Array.from(els.geminiModel.options).forEach((option) => {
+    if (!option.dataset.base) option.dataset.base = option.textContent;
+    if (!option.dataset.name) option.dataset.name = option.dataset.base.split("—")[0].trim();
+    const item = byId[option.value];
+    option.title = "";
+    if (item && !item.ok) {
+      option.classList.add("bad");
+      // Cột cài đặt hẹp nên chỉ giữ tên model + lý do, bỏ mô tả dài.
+      option.textContent = `${option.dataset.name} — ⚠ ${modelStatusText(item)}`;
+      option.title = item.detail || modelStatusText(item);
+    } else {
+      option.classList.remove("bad");
+      option.textContent = option.dataset.base;
+    }
+  });
+  if (!data.key_valid) {
+    setGeminiState(`API key không dùng được: ${data.key_error || "key bị từ chối"}.`, "bad");
+    return;
+  }
+  const current = byId[els.geminiModel.value];
+  if (current && !current.ok) {
+    const hint = data.best_model ? ` Nên chuyển sang ${data.best_model}.` : "";
+    setGeminiState(
+      `Model đang chọn ${modelStatusText(current)}.` +
+        `${hint} Khi dịch gặp lỗi này, app sẽ tự chuyển sang model đang chạy được.`,
+      "bad"
+    );
+    return;
+  }
+  const good = (data.models || []).filter((item) => item.ok).map((item) => item.id);
+  setGeminiState(`Key hợp lệ · model dùng được: ${good.join(" · ")}.`, "ok");
+}
+
+async function checkGeminiStatus(refresh = false) {
+  els.checkGeminiBtn.disabled = true;
+  setGeminiState("Đang kiểm tra API key và model…");
+  try {
+    const res = await fetch(`/api/gemini/status?probe=1${refresh ? "&refresh=1" : ""}`);
+    if (!res.ok) throw new Error("status failed");
+    applyModelStatus(await res.json());
+  } catch (err) {
+    setGeminiState("Không kiểm tra được Gemini (mạng hoặc server lỗi).", "bad");
+  } finally {
+    els.checkGeminiBtn.disabled = els.geminiModel.disabled;
+  }
+}
+
 function updateTranslateUI() {
   els.geminiBox.classList.toggle("hidden", !els.translateTo.value);
 }
@@ -243,12 +326,16 @@ async function loadSettings() {
     state.dubVoiceLabel = data.dub_voice_label || "Chí Mai";
     state.dubOutputDir = data.dub_output_dir || "D:\\banve";
     els.dubHint.textContent = `Video lồng tiếng xuất vào ${state.dubOutputDir}`;
+    state.toolV1Url = data.tool_v1_url || "http://127.0.0.1:8088";
+    els.toolV1Url.value = state.toolV1Url;
+    els.toolV1State.textContent = "Tool V1 sẽ lồng tiếng Việt và che phụ đề gốc khi render.";
     const glossary = Array.isArray(data.glossary) ? data.glossary : [];
     els.glossaryInput.value = glossary
       .map((item) => `${item.src} = ${item.dst}`)
       .join("\n");
     if (state.geminiConfigured) {
       setGeminiState("Đã lưu API key trên máy.", "ok");
+      checkGeminiStatus();
     } else {
       setGeminiState("Chưa có API key — lấy tại aistudio.google.com/apikey.");
     }
@@ -279,16 +366,159 @@ async function saveGeminiSettings() {
     state.geminiConfigured = Boolean(data.gemini_configured);
     state.translateModel = data.translate_model || model;
     els.geminiKey.value = "";
-    setGeminiState("Đã lưu API key trên máy.", "ok");
     showToast(
       "Đã lưu cài đặt dịch" + (skipped ? ` (bỏ qua ${skipped} dòng sai định dạng)` : ""),
       skipped ? "error" : "success"
     );
+    checkGeminiStatus(Boolean(key));
   } catch (err) {
     setGeminiState("Lưu thất bại.", "bad");
     showToast("Không lưu được cài đặt dịch", "error");
   } finally {
     els.saveKeyBtn.disabled = state.running;
+  }
+}
+
+async function saveToolV1Url() {
+  const url = els.toolV1Url.value.trim();
+  els.saveToolV1Btn.disabled = true;
+  try {
+    const res = await fetch("/api/settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tool_v1_url: url }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || "save failed");
+    state.toolV1Url = data.tool_v1_url || url || "http://127.0.0.1:8088";
+    els.toolV1Url.value = state.toolV1Url;
+    els.toolV1State.textContent = `Sẽ gửi sang ${state.toolV1Url}`;
+    els.toolV1State.className = "small muted";
+    showToast("Đã lưu địa chỉ Tool V1", "success");
+  } catch (err) {
+    els.toolV1State.textContent = `Không lưu được: ${String(err.message || err).slice(0, 120)}`;
+    els.toolV1State.className = "small bad";
+    showToast("Địa chỉ Tool V1 không hợp lệ", "error");
+  } finally {
+    els.saveToolV1Btn.disabled = false;
+  }
+}
+
+/* ---------------- handoff sang Tool V1 ---------------- */
+
+const HANDOFF_ACTIVE = ["queued", "running", "cancelling"];
+
+function stopHandoffPolling() {
+  if (state.handoffTimer) {
+    clearTimeout(state.handoffTimer);
+    state.handoffTimer = null;
+  }
+}
+
+function renderHandoff(record) {
+  state.handoff = record || null;
+  state.handoffFails = 0;
+  const panel = els.handoffPanel;
+  if (!record) {
+    stopHandoffPolling();
+    panel.classList.add("hidden");
+    panel.classList.remove("ok", "bad");
+    els.handoffNote.textContent = "";
+    els.handoffOut.textContent = "";
+    els.handoffBtn.textContent = "Gửi sang Tool V1 · lồng tiếng + che sub";
+    els.handoffBtn.disabled = state.running || state.handoffSending;
+    return;
+  }
+
+  const status = String(record.status || "queued");
+  const active = HANDOFF_ACTIVE.includes(status);
+  const pct = Math.max(0, Math.min(100, Number(record.progress) || 0));
+  panel.classList.remove("hidden");
+  panel.classList.toggle("ok", status === "done");
+  panel.classList.toggle("bad", status === "error" || status === "cancelled");
+  els.handoffBar.style.width = status === "done" ? "100%" : `${pct}%`;
+  els.handoffPct.textContent = status === "done" ? "100%" : `${pct}%`;
+  els.handoffStage.textContent = record.stage || "Đang chờ Tool V1 phản hồi…";
+  els.handoffCancelBtn.classList.toggle("hidden", !active || status === "cancelling");
+
+  const notes = [];
+  if (record.cue_count) notes.push(`${record.cue_count} câu`);
+  if (record.translated_count != null) notes.push(`${record.translated_count} bản dịch`);
+  const result = record.result || {};
+  if (status === "done") {
+    const bits = [];
+    if (result.voice) bits.push(`giọng ${result.voice}`);
+    if (result.voiced_count != null) bits.push(`lồng tiếng ${result.voiced_count} câu`);
+    if ((result.failed_cues || []).length) bits.push(`lỗi ${result.failed_cues.length} câu`);
+    if (result.seconds != null) bits.push(`${result.seconds}s`);
+    notes.push(bits.join(" · "));
+  }
+  const problem = record.error || record.unreachable;
+  els.handoffNote.textContent = problem ? problem : notes.join(" · ");
+  els.handoffOut.textContent = status === "done" ? String(result.delivered || result.final_video || "") : "";
+
+  els.handoffBtn.textContent = active
+    ? "Đang render ở Tool V1…"
+    : status === "done" ? "Gửi lại sang Tool V1" : "Gửi sang Tool V1 · lồng tiếng + che sub";
+  els.handoffBtn.disabled = state.running || state.handoffSending || active;
+
+  if (active) pollHandoff();
+  else stopHandoffPolling();
+}
+
+function pollHandoff(delay = 2000) {
+  stopHandoffPolling();
+  if (!state.job) return;
+  const jobId = state.job.id;
+  state.handoffTimer = setTimeout(async () => {
+    state.handoffTimer = null;
+    if (!state.job || state.job.id !== jobId) return;
+    try {
+      const res = await fetch(`/api/jobs/${jobId}/handoff`);
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        renderHandoff(data.handoff);
+        return;
+      }
+      state.handoffFails += 1;
+    } catch (err) {
+      state.handoffFails += 1;
+    }
+    // Tool V1 đang bận render có thể chậm phản hồi: thử lại thưa dần rồi dừng.
+    if (state.handoffFails < 5) pollHandoff(5000);
+    else stopHandoffPolling();
+  }, delay);
+}
+
+async function sendHandoff() {
+  if (!state.job || state.running || state.handoffSending) return;
+  const translated = state.cues.filter((cue) => (cue.trans || "").trim()).length;
+  if (!translated && !window.confirm(
+    "Chưa có bản dịch tiếng Việt cho video này.\n\nTool V1 vẫn render và che phụ đề gốc nhưng sẽ không có giọng đọc Việt. Gửi tiếp?"
+  )) return;
+  if (state.saveTimer) await saveCues(true);
+
+  state.handoffSending = true;
+  els.handoffBtn.disabled = true;
+  els.handoffBtn.textContent = "Đang gửi…";
+  try {
+    const res = await fetch(`/api/jobs/${state.job.id}/handoff`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ target_lang: els.translateTo.value || null }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `Tool V1 không phản hồi (${res.status})`);
+    renderHandoff(data.handoff);
+    showToast("Đã gửi sang Tool V1 — đang lồng tiếng và che phụ đề gốc", "success");
+  } catch (err) {
+    const message = String(err.message || err).slice(0, 200);
+    // Lần gửi hỏng: bỏ trạng thái cũ (có thể còn hiện "Hoàn tất" của lần trước) và báo lỗi ngay trên panel.
+    renderHandoff({ ...(state.handoff || {}), status: "error", stage: "Không gửi được sang Tool V1", error: message });
+    showToast(message, "error");
+  } finally {
+    state.handoffSending = false;
+    els.handoffBtn.disabled = state.running || Boolean(state.handoff && HANDOFF_ACTIVE.includes(state.handoff.status));
   }
 }
 
@@ -376,6 +606,7 @@ function openJob(job, restored) {
   state.activeRoi = 0;
   renderRoi();
   updateDubUI(job);
+  renderHandoff((job.stats || {}).handoff);
 
   els.videoError.classList.add("hidden");
   els.previewState.textContent = "";
@@ -442,6 +673,7 @@ function startJob() {
   els.progressPct.textContent = "0%";
   els.progressMsg.textContent = "";
   els.statsLine.textContent = "";
+  renderHandoff(null);
   setRunning(true);
 
   fetch(`/api/jobs/${state.job.id}/start`, {
@@ -484,8 +716,11 @@ function setRunning(running) {
   els.geminiKey.disabled = running;
   els.geminiModel.disabled = running;
   els.saveKeyBtn.disabled = running;
+  els.checkGeminiBtn.disabled = running;
   els.dubEnabled.disabled = running;
   els.addCueBtn.disabled = running;
+  els.handoffBtn.disabled = running || state.handoffSending
+    || Boolean(state.handoff && HANDOFF_ACTIVE.includes(String(state.handoff.status)));
   els.roiLayer.classList.toggle("running", running);
   updateUndoUI();
   if (running) {
@@ -668,6 +903,7 @@ function resetWorkspace() {
   state.job = null;
   state.cues = [];
   state.running = false;
+  renderHandoff(null);
   state.selecting = false;
   state.drag = null;
   state.activeCue = -1;
@@ -695,6 +931,7 @@ function resetWorkspace() {
   els.geminiKey.disabled = false;
   els.geminiModel.disabled = false;
   els.saveKeyBtn.disabled = false;
+  els.checkGeminiBtn.disabled = false;
   els.roiLayer.classList.remove("selecting", "running");
   els.roiHint.classList.add("hidden");
   els.roiSelectBtn.classList.remove("active");
@@ -966,6 +1203,7 @@ async function saveCues(immediate = false) {
       end: cue.end,
       text: cue.text,
       trans: cue.trans || "",
+      region: Number.isInteger(cue.region) ? cue.region : null,
     }));
   els.saveState.textContent = "Đang lưu…";
   try {
@@ -1116,7 +1354,10 @@ function addCue() {
   let end = start + 1.5;
   if (duration > 0.5) end = Math.min(end, duration);
   if (end - start < 0.3) end = start + 0.3;
-  const cue = { start: round3(start), end: round3(end), text: "", trans: "" };
+  const cue = {
+    start: round3(start), end: round3(end), text: "", trans: "",
+    region: anchor && Number.isInteger(anchor.region) ? anchor.region : null,
+  };
   state.cues.splice(anchorIndex + 1, 0, cue);
   renderCues();
   markDirty();
@@ -1173,7 +1414,7 @@ function splitCue(event) {
   const [transLeft, transRight] = splitTextAt(cue.trans || "", ratio);
   state.cues.splice(index, 1,
     { ...cue, end: mid, text: left, trans: transLeft },
-    { start: mid, end: cue.end, text: right, trans: transRight });
+    { start: mid, end: cue.end, text: right, trans: transRight, region: cue.region });
   renderCues();
   restoreUntranslated(keep, wasUntranslated ? [index, index + 1] : []);
   markDirty();
@@ -1552,6 +1793,7 @@ function bindEvents() {
 
   els.translateTo.addEventListener("change", updateTranslateUI);
   els.saveKeyBtn.addEventListener("click", saveGeminiSettings);
+  els.checkGeminiBtn.addEventListener("click", () => checkGeminiStatus(true));
   els.geminiModel.addEventListener("change", () => {
     if (state.geminiConfigured) saveGeminiSettings();
   });
@@ -1600,6 +1842,28 @@ function bindEvents() {
 
   els.exportSrt.addEventListener("click", () => exportCues("srt"));
   els.exportVtt.addEventListener("click", () => exportCues("vtt"));
+
+  els.saveToolV1Btn.addEventListener("click", saveToolV1Url);
+  els.toolV1Url.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") saveToolV1Url();
+  });
+  els.handoffBtn.addEventListener("click", sendHandoff);
+  els.handoffCloseBtn.addEventListener("click", () => renderHandoff(null));
+  els.handoffCancelBtn.addEventListener("click", async () => {
+    if (!state.job || !state.handoff || String(state.handoff.status) === "cancelling") return;
+    els.handoffCancelBtn.disabled = true;
+    try {
+      const res = await fetch(`/api/jobs/${state.job.id}/handoff/cancel`, { method: "POST" });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || "Không hủy được render");
+      renderHandoff(data.handoff);
+      showToast("Đã yêu cầu Tool V1 dừng render", "success");
+    } catch (err) {
+      showToast(String(err.message || err).slice(0, 200), "error");
+    } finally {
+      els.handoffCancelBtn.disabled = false;
+    }
+  });
 }
 
 async function restoreLastJob() {

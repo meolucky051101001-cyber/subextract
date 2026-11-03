@@ -5,8 +5,11 @@ import json
 import mimetypes
 import os
 import threading
+import time
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import quote
 
@@ -16,12 +19,21 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from . import handoff
 from .jobs import Job, JobStore
 from .pipeline.dub import DEFAULT_OUTPUT_DIR, DEFAULT_VOICE, DEFAULT_VOICE_LABEL
 from .pipeline.ffmpeg_io import FFmpegError, probe_video
 from .pipeline.post import to_srt, to_vtt
 from .pipeline.runner import Cancelled, RunParams, run_pipeline
-from .pipeline.translate import ALLOWED_MODELS, DEFAULT_MODEL, normalize_model, translate_cues
+from .pipeline.translate import (
+    ALLOWED_MODELS,
+    DEFAULT_MODEL,
+    MODEL_LABELS,
+    check_key,
+    normalize_model,
+    probe_model,
+    translate_cues,
+)
 from .settings import get_gemini_keys, load_settings, read_usage, save_settings
 
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -30,10 +42,43 @@ DATA_DIR = Path(os.environ.get("SUBEXTRACT_DATA_DIR") or BASE_DIR / "data" / "jo
 
 store = JobStore(DATA_DIR)
 
-app = FastAPI(title="SubExtract Local")
+
+_prev_loop_exception_handler = None
+
+
+def _quiet_connection_noise(loop, context):
+    """Bỏ traceback ConnectionResetError mà asyncio proactor Windows sinh ra khi
+    trình duyệt ngắt kết nối giữa lúc server đang gửi dữ liệu. Lỗi khác vẫn giữ
+    đường xử lý cũ để không che lỗi thật."""
+    exc = context.get("exception")
+    message = str(context.get("message") or "")
+    if isinstance(exc, ConnectionResetError) and "_call_connection_lost" in message:
+        return
+    if _prev_loop_exception_handler is not None:
+        _prev_loop_exception_handler(loop, context)
+    else:
+        loop.default_exception_handler(context)
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    global _prev_loop_exception_handler
+    loop = asyncio.get_running_loop()
+    _prev_loop_exception_handler = loop.get_exception_handler()
+    loop.set_exception_handler(_quiet_connection_noise)
+    try:
+        yield
+    finally:
+        loop.set_exception_handler(_prev_loop_exception_handler)
+
+
+app = FastAPI(title="SubExtract Local", lifespan=_lifespan)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 _gpu_cache: dict | None = None
+GEMINI_STATUS_TTL = 900.0
+_gemini_status_lock = threading.Lock()
+_gemini_status_cache: dict | None = None
 
 
 def gpu_info() -> dict:
@@ -52,6 +97,56 @@ def gpu_info() -> dict:
         info["error"] = str(exc)
     _gpu_cache = info
     return info
+
+
+def _build_gemini_status(keys: list[str], probed: bool) -> dict:
+    key_state = check_key(keys[0])
+    working = keys[0]
+    if not key_state["ok"]:
+        for alt in keys[1:]:
+            alt_state = check_key(alt)
+            if alt_state["ok"]:
+                key_state, working = alt_state, alt
+                break
+
+    results: dict[str, dict] = {}
+    if probed and key_state["ok"]:
+        with ThreadPoolExecutor(max_workers=len(ALLOWED_MODELS)) as pool:
+            for result in pool.map(lambda model: probe_model(working, model), ALLOWED_MODELS):
+                results[result["model"]] = result
+
+    listed = key_state["models"]
+    entries: list[dict] = []
+    best = ""
+    for model in ALLOWED_MODELS:
+        entry = {"id": model, "label": MODEL_LABELS.get(model, model),
+                 "ok": False, "reason": "", "detail": ""}
+        if not key_state["ok"]:
+            entry.update({"reason": "auth", "detail": key_state["error"]})
+        elif model in results:
+            result = results[model]
+            entry.update({"ok": result["ok"], "reason": result["reason"],
+                          "detail": result["detail"], "status": result["status"]})
+        elif listed and model not in listed:
+            entry.update({"reason": "not_found",
+                          "detail": "Model không có trong tài khoản của key này."})
+        else:
+            entry.update({"ok": True, "reason": "ok", "detail": ""})
+        if entry["ok"] and not best:
+            best = model
+        entries.append(entry)
+
+    return {
+        "ok": bool(best),
+        "key_configured": True,
+        "key_valid": bool(key_state["ok"]),
+        "key_error": key_state["error"],
+        "keys_total": len(keys),
+        "probed": probed,
+        "models": entries,
+        "best_model": best,
+        "checked_at": round(time.time(), 1),
+    }
 
 
 class StartBody(BaseModel):
@@ -93,6 +188,7 @@ class CueBody(BaseModel):
     end: float
     text: str
     trans: str = ""
+    region: int | None = None
 
 
 class CuesBody(BaseModel):
@@ -109,12 +205,21 @@ class SettingsBody(BaseModel):
     translate_model: str | None = None
     glossary: list[GlossaryItem] | None = None
     dub_output_dir: str | None = None
+    tool_v1_url: str | None = None
 
 
 class RetranslateBody(BaseModel):
     index: int
     text: str | None = None
     target: str | None = None
+
+
+class HandoffBody(BaseModel):
+    tool_v1_url: str | None = None
+    target_lang: str | None = None
+    voice_id: str | None = None
+    original_volume_db: float | None = None
+    dubbing_volume_db: float | None = None
 
 
 def _get_job(job_id: str) -> Job:
@@ -153,7 +258,44 @@ def get_settings():
         "dub_voice": str(data.get("dub_voice") or DEFAULT_VOICE),
         "dub_voice_label": str(data.get("dub_voice_label") or DEFAULT_VOICE_LABEL),
         "dub_output_dir": str(data.get("dub_output_dir") or DEFAULT_OUTPUT_DIR),
+        "tool_v1_url": str(data.get("tool_v1_url") or handoff.DEFAULT_TOOL_V1_URL),
     }
+
+
+@app.get("/api/gemini/status")
+def gemini_status(probe: int = 1, refresh: int = 0):
+    """Kiểm tra key Gemini còn dùng được và model nào đang trả lời được.
+
+    probe=1 (mặc định) gọi thật một request siêu nhỏ cho từng model để phát hiện
+    quá tải (503) hoặc hết quota (429); kết quả được cache GEMINI_STATUS_TTL giây
+    để mở app nhiều lần không gọi API liên tục.
+    """
+    global _gemini_status_cache
+    keys = get_gemini_keys()
+    current = normalize_model(load_settings().get("translate_model"))
+    if not keys:
+        return {
+            "ok": False, "key_configured": False, "key_valid": False,
+            "key_error": "Chưa cấu hình Gemini API key.", "probed": False,
+            "models": [{"id": m, "label": MODEL_LABELS.get(m, m), "ok": False,
+                        "reason": "no_key", "detail": ""} for m in ALLOWED_MODELS],
+            "best_model": "", "current_model": current, "cached": False, "checked_at": 0,
+        }
+    with _gemini_status_lock:
+        now = time.time()
+        cached = _gemini_status_cache
+        if (not refresh) and cached and (now - cached["ts"]) < GEMINI_STATUS_TTL \
+                and (cached["probed"] or not probe):
+            payload = dict(cached["payload"])
+            payload["cached"] = True
+            payload["current_model"] = current
+            return payload
+        payload = _build_gemini_status(keys, bool(probe))
+        _gemini_status_cache = {"ts": now, "probed": bool(probe), "payload": payload}
+        out = dict(payload)
+        out["cached"] = False
+        out["current_model"] = current
+        return out
 
 
 @app.put("/api/settings")
@@ -176,13 +318,23 @@ def update_settings(body: SettingsBody):
         folder = body.dub_output_dir.strip()
         if folder:
             updates["dub_output_dir"] = folder[:260]
+    if body.tool_v1_url is not None:
+        url = body.tool_v1_url.strip()
+        if url:
+            try:
+                updates["tool_v1_url"] = handoff.resolve_url(url)
+            except handoff.HandoffError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        else:
+            updates["tool_v1_url"] = ""
     if updates:
         save_settings(updates)
     data = load_settings()
     return {"ok": True, "gemini_configured": bool(get_gemini_keys()),
             "translate_model": normalize_model(data.get("translate_model")),
             "glossary": data.get("glossary") or [],
-            "dub_output_dir": str(data.get("dub_output_dir") or DEFAULT_OUTPUT_DIR)}
+            "dub_output_dir": str(data.get("dub_output_dir") or DEFAULT_OUTPUT_DIR),
+            "tool_v1_url": str(data.get("tool_v1_url") or handoff.DEFAULT_TOOL_V1_URL)}
 
 
 @app.get("/api/usage")
@@ -304,6 +456,10 @@ def _run_job_thread(job: Job, params: RunParams) -> None:
             )
         else:
             job.message = f"Hoàn tất: {len(job.cues)} cue phụ đề."
+        fallback_from = job.stats.get("translate_fallback_from") or []
+        model_used = str(job.stats.get("translate_model_used") or "")
+        if fallback_from and model_used:
+            job.message += f" · {fallback_from[0]} không dùng được, đã chuyển sang {model_used}"
         dub_output = str(job.stats.get("dub_output") or "")
         dub_error = str(job.stats.get("dub_error") or "")
         if (job.params or {}).get("dub"):
@@ -449,6 +605,7 @@ def update_cues(job_id: str, body: CuesBody):
             "end": round(end, 3),
             "text": text,
             "trans": cue.trans.strip(),
+            "region": cue.region,
         })
     job.cues = cues
     job.save()
@@ -492,6 +649,135 @@ def retranslate_cue(job_id: str, body: RetranslateBody):
     cue["trans"] = trans
     job.save()
     return {"ok": True, "index": body.index, "trans": trans}
+
+
+_handoff_lock = threading.Lock()
+_handoff_busy: set[str] = set()
+_HANDOFF_ACTIVE = {"queued", "running", "cancelling"}
+
+
+def _handoff_record(job: Job) -> dict:
+    return dict((job.stats or {}).get("handoff") or {})
+
+
+def _save_handoff(job: Job, record: dict) -> None:
+    job.stats = job.stats or {}
+    job.stats["handoff"] = record
+    job.save()
+
+
+@app.post("/api/jobs/{job_id}/handoff")
+def send_handoff(job_id: str, body: HandoffBody):
+    """Gửi phụ đề + bản dịch sang Tool V1 để lồng tiếng Việt và che phụ đề gốc."""
+    job = _get_job(job_id)
+    if job.status == "running":
+        raise HTTPException(status_code=409, detail="Job đang chạy, hãy chờ xong rồi gửi sang Tool V1")
+    if not job.cues:
+        raise HTTPException(status_code=400, detail="Job chưa có phụ đề để gửi")
+
+    try:
+        base = handoff.resolve_url(body.tool_v1_url or load_settings().get("tool_v1_url"))
+    except handoff.HandoffError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    target = ((body.target_lang or "").strip().lower()
+              or str((job.params or {}).get("translate_to") or "vi"))
+
+    try:
+        payload = handoff.build_payload(job, target)
+    except handoff.HandoffError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    with _handoff_lock:
+        if job_id in _handoff_busy:
+            raise HTTPException(status_code=409, detail="Đang gửi job này sang Tool V1, chờ vài giây...")
+        previous = _handoff_record(job)
+        if previous.get("remote_job_id") and str(previous.get("status") or "queued") in _HANDOFF_ACTIVE:
+            raise HTTPException(
+                status_code=409,
+                detail="Tool V1 đang render cho video này — chờ xong hoặc bấm Hủy trước khi gửi lại.",
+            )
+        _handoff_busy.add(job_id)
+    try:
+        result = handoff.import_and_render(base, payload, {
+            "voice_id": body.voice_id,
+            "original_volume_db": body.original_volume_db,
+            "dubbing_volume_db": body.dubbing_volume_db,
+        })
+    except handoff.HandoffError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    finally:
+        with _handoff_lock:
+            _handoff_busy.discard(job_id)
+
+    imported = result.get("imported") or {}
+    started = result.get("render") or {}
+    record = {
+        "status": "queued",
+        "progress": 0,
+        "stage": "Đã gửi sang Tool V1, đang chờ render...",
+        "base_url": result.get("base_url"),
+        "remote_job_id": started.get("job_id"),
+        "stem": imported.get("stem"),
+        "job_dir": imported.get("job_dir"),
+        "video_link": imported.get("video_link"),
+        "cue_count": imported.get("cue_count"),
+        "translated_count": imported.get("translated_count"),
+        "target_lang": payload["target_lang"],
+        "sent_at": round(time.time(), 1),
+        "error": "",
+        "result": None,
+    }
+    _save_handoff(job, record)
+    return {"ok": True, "handoff": record}
+
+
+@app.get("/api/jobs/{job_id}/handoff")
+def get_handoff(job_id: str):
+    """Đọc tiến độ render từ Tool V1; trả handoff=None khi chưa từng gửi."""
+    job = _get_job(job_id)
+    record = _handoff_record(job)
+    if not record.get("remote_job_id"):
+        return {"ok": True, "handoff": None}
+    try:
+        remote = handoff.status(record.get("base_url"), record["remote_job_id"])
+    except handoff.HandoffError as exc:
+        record["unreachable"] = str(exc)
+        return {"ok": True, "handoff": record}
+
+    changed = (
+        record.get("status") != remote.get("status")
+        or record.get("progress") != remote.get("progress")
+        or record.get("stage") != remote.get("stage")
+    )
+    record.update({
+        "status": str(remote.get("status") or record.get("status") or "queued"),
+        "progress": int(remote.get("progress") or 0),
+        "stage": str(remote.get("stage") or ""),
+        "error": str(remote.get("error") or ""),
+        "result": remote.get("result"),
+        "unreachable": "",
+    })
+    if changed:
+        with _handoff_lock:
+            _save_handoff(job, record)
+    return {"ok": True, "handoff": record}
+
+
+@app.post("/api/jobs/{job_id}/handoff/cancel")
+def cancel_handoff(job_id: str):
+    job = _get_job(job_id)
+    record = _handoff_record(job)
+    if not record.get("remote_job_id"):
+        raise HTTPException(status_code=400, detail="Chưa có bản gửi Tool V1 nào để hủy")
+    try:
+        handoff.cancel(record.get("base_url"), record["remote_job_id"])
+    except handoff.HandoffError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    record["status"] = "cancelling"
+    record["stage"] = "Đã yêu cầu Tool V1 dừng render..."
+    with _handoff_lock:
+        _save_handoff(job, record)
+    return {"ok": True, "handoff": record}
 
 
 def _with_variant(cues: list[dict], variant: str) -> list[dict]:

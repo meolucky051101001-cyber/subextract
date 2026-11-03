@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SubExtract Local — Bóc phụ đề hardsub</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect x='3' y='5' width='18' height='14' rx='3' fill='%2314161d' stroke='%237c5cff'/%3E%3Cpath d='M7 15h4M13 15h4' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="/static/style.css?v=20261030f">
+  <link rel="stylesheet" href="/static/style.css?v=20261103e">
 </head>
 <body>
   <div class="bg-glow" aria-hidden="true"></div>
@@ -109,11 +109,14 @@
               <input type="password" id="geminiKey" autocomplete="off" placeholder="Gemini API key (AIza…)">
               <button class="btn ghost small" id="saveKeyBtn" type="button">Lưu</button>
             </div>
-            <select id="geminiModel" aria-label="Model dịch">
-              <option value="gemini-3.5-flash-lite" selected>Gemini 3.5 Flash-Lite — nhanh, tiết kiệm</option>
-              <option value="gemini-3.8-flash">Gemini 3.8 Flash — chất lượng cao, chậm hơn</option>
-              <option value="gemini-4-argon">Gemini 4 Argon — chất lượng tối đa</option>
-            </select>
+            <div class="model-row">
+              <select id="geminiModel" aria-label="Model dịch">
+                <option value="gemini-3.5-flash-lite" selected>Gemini 3.5 Flash-Lite — nhanh, tiết kiệm</option>
+                <option value="gemini-3.8-flash">Gemini 3.8 Flash — chất lượng cao, chậm hơn</option>
+                <option value="gemini-4-argon">Gemini 4 Argon — chất lượng tối đa</option>
+              </select>
+              <button class="btn ghost small" id="checkGeminiBtn" type="button" title="Kiểm tra API key và model nào đang dùng được">Kiểm tra</button>
+            </div>
             <label class="field-label gloss-label" for="glossaryInput">Thuật ngữ riêng <span class="muted">— tên riêng, thương hiệu</span></label>
             <textarea id="glossaryInput" rows="3" spellcheck="false" placeholder="Mỗi dòng: gốc = bản dịch&#10;Ví dụ: mentor = người hướng dẫn"></textarea>
             <span id="geminiState" class="small muted">Chưa kiểm tra API key.</span>
@@ -121,6 +124,13 @@
 
           <label class="chip dub-chip"><input type="checkbox" id="dubEnabled" checked><span>AI lồng tiếng · Chí Mai</span></label>
           <span id="dubHint" class="small muted">Video lồng tiếng xuất vào D:\banve</span>
+
+          <label class="field-label" for="toolV1Url">Tool V1 AutoDub <span class="muted">— nhận bản dịch để lồng tiếng + che sub</span></label>
+          <div class="key-row">
+            <input type="text" id="toolV1Url" spellcheck="false" placeholder="http://127.0.0.1:8088">
+            <button class="btn ghost small" id="saveToolV1Btn" type="button">Lưu</button>
+          </div>
+          <span id="toolV1State" class="small muted">Mặc định: http://127.0.0.1:8088</span>
 
           <label class="field-label" for="fpsSelect">Tốc độ lấy mẫu</label>
           <select id="fpsSelect">
@@ -164,17 +174,29 @@
             </select>
             <button class="btn" id="exportSrt" type="button">Tải SRT</button>
             <button class="btn ghost" id="exportVtt" type="button">Tải VTT</button>
+            <button class="btn toolv1" id="handoffBtn" type="button" title="Gửi bản dịch sang Tool V1 để lồng tiếng Việt và che phụ đề gốc">Gửi sang Tool V1 · lồng tiếng + che sub</button>
           </div>
         </div>
         <p class="hint muted small">Nhấp vào chữ để sửa nội dung gốc hoặc bản dịch — tự động lưu. <span aria-hidden="true">⟳</span> dịch lại cue bằng Gemini · nút tách/gộp dòng nằm bên phải mỗi cue · Ctrl+Z hoàn tác thao tác dòng. Nhấp ra ngoài chữ để tua video.</p>
         <div class="find-row"><input id="findInput" type="text" placeholder="Tìm trong cue…" spellcheck="false"><input id="replaceInput" type="text" placeholder="Thay bằng…" spellcheck="false"><button class="btn ghost small" id="replaceAllBtn" type="button">Thay tất cả</button><span id="findCount" class="muted small"></span></div>
         <p id="dubResult" class="hint muted small hidden"></p>
+        <div id="handoffPanel" class="handoff hidden">
+          <div class="handoff-head">
+            <span id="handoffStage">Đang gửi sang Tool V1…</span>
+            <span id="handoffPct" class="mono">0%</span>
+            <button class="btn ghost small" id="handoffCancelBtn" type="button">Hủy render</button>
+            <button class="btn ghost small" id="handoffCloseBtn" type="button">Đóng</button>
+          </div>
+          <div class="bar"><i id="handoffBar"></i></div>
+          <div id="handoffNote" class="muted small"></div>
+          <div id="handoffOut" class="mono small"></div>
+        </div>
         <div id="cueList" class="cue-list"></div>
       </section>
     </section>
   </main>
 
   <div id="toast" class="toast hidden" role="status"></div>
-  <script src="/static/app.js?v=20261030f"></script>
+  <script src="/static/app.js?v=20261103e"></script>
 </body>
 </html>

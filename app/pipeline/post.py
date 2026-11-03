@@ -160,7 +160,7 @@ def build_cues(
             fixed[-1]["end"] = round(max(fixed[-1]["start"] + 0.2, cue["start"]), 3)
         fixed.append(cue)
     return [
-        {"start": c["start"], "end": c["end"], "text": c["text"]}
+        {"start": c["start"], "end": c["end"], "text": c["text"], "region": c.get("_region")}
         for c in fixed
     ]
 

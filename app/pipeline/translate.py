@@ -23,6 +23,11 @@ MODEL_LIMITS = {
     "gemini-4-argon": {"timeout": 300.0, "batch_size": 12},
 }
 TARGET_LABELS = {"vi": "tiếng Việt", "en": "English", "zh": "中文（简体）"}
+MODEL_LABELS = {
+    "gemini-3.5-flash-lite": "Gemini 3.5 Flash-Lite",
+    "gemini-3.8-flash": "Gemini 3.8 Flash",
+    "gemini-4-argon": "Gemini 4 Argon",
+}
 
 _HAN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 _VI_CHARS = set("ăâđêôơưàáảãạằắẳẵặầấẩẫậèéẻẽẹềếểễệìíỉĩịòóỏõọồốổỗộờớởỡợùúủũụừứửữựỳýỷỹỵ")
@@ -217,20 +222,37 @@ def _generate(api_key: str, model: str, prompt: str, timeout: float | None = Non
     return _handle_response(result.get("status"), payload, api_key)
 
 
+def _error_message(status: int, payload: dict, api_key: str) -> str:
+    err = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(err, list) and err:
+        err = err[0]
+    message = str((err or {}).get("message") or f"HTTP {status}")
+    return message.replace(api_key, "***")[:300]
+
+
+def _failure_reason(status: int, message: str) -> str:
+    lowered = message.lower()
+    if status in (401, 403) or "api key" in lowered or "api_key" in lowered or "permission" in lowered:
+        return "auth"
+    if status == 429 or "quota" in lowered or "resource_exhausted" in lowered:
+        return "quota"
+    if status == 404 or "not found" in lowered or "not supported" in lowered:
+        return "not_found"
+    if status in (408, 409, 500, 502, 503, 504) or "high demand" in lowered or "try again later" in lowered:
+        return "unavailable"
+    return "error"
+
+
 def _handle_response(status: int, payload: dict, api_key: str) -> dict:
     if status == 200:
         if payload:
             return payload
         raise TranslateError("Gemini trả về dữ liệu rỗng") from None
-    err = payload.get("error") if isinstance(payload, dict) else None
-    if isinstance(err, list) and err:
-        err = err[0]
-    message = str((err or {}).get("message") or f"HTTP {status}")
-    message = message.replace(api_key, "***")[:300]
-    lowered = message.lower()
-    if status in (401, 403) or "api key" in lowered or "api_key" in lowered or "permission" in lowered:
+    message = _error_message(status, payload, api_key)
+    reason = _failure_reason(status, message)
+    if reason == "auth":
         raise TranslateAuthError(message) from None
-    if status == 429 or "quota" in lowered or "resource_exhausted" in lowered:
+    if reason == "quota":
         raise TranslateQuotaError(f"Gemini hết hạn mức (429): {message}") from None
     if status in (408, 409, 500, 502, 503, 504):
         raise TranslateTransientError(f"Gemini lỗi {status}: {message}") from None
@@ -285,6 +307,57 @@ def _sleep(seconds: float, cancel_event) -> None:
         time.sleep(0.25)
 
 
+def _raw_request(method: str, path: str, api_key: str, body: dict | None, timeout: float) -> tuple[int, dict]:
+    conn = http.client.HTTPSConnection(API_HOST, timeout=timeout)
+    headers = {"x-goog-api-key": api_key}
+    payload = None
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+        payload = json.dumps(body).encode("utf-8")
+    try:
+        conn.request(method, path, body=payload, headers=headers)
+        resp = conn.getresponse()
+        status = resp.status
+        raw = resp.read()
+    except (OSError, http.client.HTTPException) as exc:
+        return 0, {"exc": str(exc)}
+    finally:
+        _hard_close(conn)
+    try:
+        return status, json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return status, {}
+
+
+def check_key(api_key: str, timeout: float = 15.0) -> dict:
+    """Xác minh key bằng listModels — không sinh token nên gần như miễn phí."""
+    status, payload = _raw_request("GET", "/v1beta/models?pageSize=200", api_key, None, timeout)
+    if status == 0:
+        return {"ok": False, "error": f"Không kết nối được Gemini: {payload.get('exc')}", "models": []}
+    if status != 200:
+        return {"ok": False, "error": _error_message(status, payload, api_key), "models": []}
+    listed = [str(item.get("name") or "").rsplit("/", 1)[-1] for item in payload.get("models") or []]
+    return {"ok": True, "error": "", "models": [name for name in listed if name]}
+
+
+def probe_model(api_key: str, model: str, timeout: float = 25.0) -> dict:
+    """Gửi một request nhỏ để phát hiện model quá tải hoặc hết quota."""
+    body = {
+        "contents": [{"role": "user", "parts": [{"text": "Trả lời đúng một ký tự: ok"}]}],
+        "generationConfig": {"maxOutputTokens": 1},
+    }
+    path = f"/v1beta/models/{parse.quote(model, safe='')}:generateContent"
+    status, payload = _raw_request("POST", path, api_key, body, timeout)
+    if status == 0:
+        return {"model": model, "ok": False, "status": 0, "reason": "unreachable",
+                "detail": f"Không kết nối được Gemini: {payload.get('exc')}"}
+    if status == 200:
+        return {"model": model, "ok": True, "status": 200, "reason": "ok", "detail": ""}
+    message = _error_message(status, payload, api_key)
+    return {"model": model, "ok": False, "status": status,
+            "reason": _failure_reason(status, message), "detail": message[:180]}
+
+
 def _translate_batch(api_keys, model, items, target, previous, cancel_event, strict=False, glossary_text=""):
     if strict and len(items) == 1:
         prompt = _retry_prompt(items[0][0], items[0][1], target, glossary_text)
@@ -308,6 +381,55 @@ def _translate_batch(api_keys, model, items, target, previous, cancel_event, str
                 raise
             _sleep(delay, cancel_event)
             delay *= 2.5
+
+
+def _fallback_order(model: str) -> tuple[str, ...]:
+    return (model,) + tuple(other for other in ALLOWED_MODELS if other != model)
+
+
+def _batch_with_fallback(keys, candidates, state, items, target, previous, cancel_event,
+                         strict=False, glossary_text=""):
+    """Dịch một lô, tự chuyển sang model khác khi model đang dùng quá tải hoặc
+    hết quota. Trả về (mapping, outcome): outcome rỗng khi thành công, "stop"
+    khi phải dừng toàn bộ, "skip" khi bỏ riêng lô này."""
+    while state["index"] < len(candidates):
+        model = candidates[state["index"]]
+        try:
+            mapping = _translate_batch(
+                keys, model, items, target, previous, cancel_event,
+                strict=strict, glossary_text=glossary_text,
+            )
+            return mapping, ""
+        except Cancelled:
+            raise
+        except TranslateAuthError as exc:
+            # Key bị từ chối thì mọi model đều chung số phận: dừng ngay.
+            state["error"] = str(exc) or "Gemini API key không dùng được."
+            return {}, "stop"
+        except (TranslateQuotaError, TranslateTransientError) as exc:
+            if state["index"] + 1 >= len(candidates):
+                state["error"] = str(exc) or "Gemini không khả dụng."
+                return {}, "stop"
+            if model not in state["switched_from"]:
+                state["switched_from"].append(model)
+            state["index"] += 1
+            nxt_limit = int(MODEL_LIMITS.get(candidates[state["index"]], {}).get("batch_size", len(items)))
+            if len(items) > nxt_limit:
+                # Lô đang cắt vượt giới hạn của model mới: trả về để caller cắt lại
+                # trước khi gửi, tránh request quá chậm trên model mới.
+                return {}, "rechunk"
+            continue
+        except TranslateError as exc:
+            state["error"] = str(exc) or "Dịch thất bại."
+            return {}, "skip"
+    state["error"] = state["error"] or "Hết model khả dụng để thử."
+    return {}, "stop"
+
+
+def _chunk_size(batch_size: int, candidates, state) -> int:
+    """Số cue mỗi lô theo giới hạn của model đang hoạt động."""
+    model = candidates[min(state["index"], len(candidates) - 1)]
+    return max(1, min(batch_size, int(MODEL_LIMITS.get(model, {}).get("batch_size", batch_size))))
 
 
 def translate_cues(
@@ -335,7 +457,7 @@ def translate_cues(
         return {"translated": 0, "total": 0, "chars": 0, "seconds": 0.0, "error": "Chưa cấu hình Gemini API key.", "untranslated": []}
 
     model = normalize_model(model)
-    batch_size = min(int(batch_size), int(MODEL_LIMITS.get(model, {}).get("batch_size", 24)))
+    batch_size = max(1, min(int(batch_size), 24))
     glossary_text = _glossary_text(_norm_glossary(glossary))
     pending: list[tuple[int, str]] = []
     for index, cue in enumerate(cues):
@@ -356,21 +478,28 @@ def translate_cues(
     error_message = ""
     previous = ""
     stop_all = False
-    for start in range(0, total, batch_size):
+    done = 0
+    cursor = 0
+    candidates = _fallback_order(model)
+    state = {"index": 0, "error": "", "switched_from": []}
+    while cursor < total:
         if cancel_event is not None and cancel_event.is_set():
             raise Cancelled()
-        chunk = pending[start:start + batch_size]
+        size = _chunk_size(batch_size, candidates, state)
+        chunk = pending[cursor:cursor + size]
+        cursor += len(chunk)
         retry: list[tuple[int, str]] = []
-        try:
-            mapping = _translate_batch(keys, model, chunk, target, previous, cancel_event, glossary_text=glossary_text)
-        except Cancelled:
-            raise
-        except (TranslateQuotaError, TranslateAuthError) as exc:
-            # Mọi key đều hết quota / bị từ chối: dừng thay vì thử các lô còn lại.
-            error_message = str(exc) or "Gemini API key không dùng được."
+        mapping, outcome = _batch_with_fallback(
+            keys, candidates, state, chunk, target, previous, cancel_event, glossary_text=glossary_text
+        )
+        if outcome == "stop":
+            error_message = state["error"]
             break
-        except TranslateError as exc:
-            error_message = str(exc) or "Dịch thất bại."
+        if outcome == "skip":
+            error_message = state["error"]
+            continue
+        if outcome == "rechunk":
+            cursor -= len(chunk)
             continue
         for index, text in chunk:
             value = mapping.get(index, "").strip()
@@ -382,18 +511,15 @@ def translate_cues(
         for index, text in retry:
             if cancel_event is not None and cancel_event.is_set():
                 raise Cancelled()
-            try:
-                single = _translate_batch(
-                    keys, model, [(index, text)], target, "", cancel_event,
-                    strict=True, glossary_text=glossary_text,
-                )
-            except Cancelled:
-                raise
-            except (TranslateQuotaError, TranslateAuthError) as exc:
-                error_message = str(exc) or "Gemini API key không dùng được."
+            single, outcome = _batch_with_fallback(
+                keys, candidates, state, [(index, text)], target, "", cancel_event,
+                strict=True, glossary_text=glossary_text,
+            )
+            if outcome == "stop":
+                error_message = state["error"]
                 stop_all = True
                 break
-            except TranslateError:
+            if outcome == "skip":
                 continue
             value = single.get(index, "").strip()
             if value and not _looks_untranslated(text, value, target):
@@ -408,8 +534,9 @@ def translate_cues(
                 previous = json.dumps(
                     {"text": chunk[-1][1], "translation": last_trans}, ensure_ascii=False
                 )
+        done = min(total, done + len(chunk))
         if progress:
-            progress(min(total, start + len(chunk)), total)
+            progress(done, total)
 
     untranslated = [
         index for index, _text in pending
@@ -421,5 +548,8 @@ def translate_cues(
         "chars": chars,
         "seconds": round(time.time() - started, 1),
         "error": error_message,
+        "model": candidates[state["index"]] if state["index"] < len(candidates) else model,
+        "requested_model": model,
+        "fallback_from": list(state["switched_from"]),
         "untranslated": untranslated,
     }

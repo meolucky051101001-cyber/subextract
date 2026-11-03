@@ -402,6 +402,8 @@ def run_pipeline(
         translate_total = 0
         translate_seconds = 0.0
         translate_error = ""
+        translate_model_used = ""
+        translate_fallback_from: list[str] = []
         untranslated_indices: list[int] = []
         if params.translate_to and cues:
             if cancel_event.is_set():
@@ -430,10 +432,18 @@ def run_pipeline(
             translate_total = translation["total"]
             translate_seconds = translation["seconds"]
             translate_error = translation["error"]
+            translate_model_used = str(translation.get("model") or params.translate_model)
+            translate_fallback_from = list(translation.get("fallback_from") or [])
             untranslated_indices = translation.get("untranslated") or []
+            if translate_fallback_from:
+                report(
+                    "translate",
+                    0.96,
+                    f"{translate_fallback_from[0]} không dùng được, đã chuyển sang dịch bằng {translate_model_used}.",
+                )
             log_usage({
                 "job": Path(work_dir).name,
-                "model": params.translate_model,
+                "model": translate_model_used,
                 "target": params.translate_to,
                 "chars": translation.get("chars") or 0,
                 "cues": translated_cues,
@@ -500,6 +510,8 @@ def run_pipeline(
             "translated_cues": translated_cues,
             "translate_total": translate_total,
             "translate_error": translate_error,
+            "translate_model_used": translate_model_used,
+            "translate_fallback_from": translate_fallback_from,
             "untranslated_cues": len(untranslated_indices),
             "untranslated_indices": untranslated_indices[:200],
             "dub_enabled": bool(params.dub),
