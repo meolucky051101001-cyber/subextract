@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 import unicodedata
 
@@ -118,6 +119,48 @@ def han_ratio(text: str) -> float:
     return sum(1 for c in chars if _HAN.match(c)) / len(chars)
 
 
+def _timestamp_ms(seconds: float) -> int:
+    return int(round(seconds * 1000.0))
+
+
+def _normalise_region_cues(cues: list[dict], merge_gap_ms: int) -> list[dict]:
+    """Merge and de-overlap each ROI independently, then sort globally."""
+    regions: list[tuple[object, list[dict]]] = []
+    for cue in cues:
+        bucket = next((items for region, items in regions if region == cue["region"]), None)
+        if bucket is None:
+            bucket = []
+            regions.append((cue["region"], bucket))
+        bucket.append(cue)
+
+    result: list[dict] = []
+    for _region, bucket in regions:
+        bucket.sort(key=lambda cue: (cue["start_ms"], cue["order"]))
+        merged: list[dict] = []
+        for cue in bucket:
+            previous = merged[-1] if merged else None
+            if previous is not None and previous["text"] == cue["text"] and cue["start_ms"] - previous["end_ms"] <= merge_gap_ms:
+                previous["end_ms"] = max(previous["end_ms"], cue["end_ms"])
+            else:
+                merged.append(dict(cue))
+
+        # Clip every cue at the next DISTINCT start in its ROI. Equal-start
+        # conflicts (including millisecond rounding ties) retain both texts:
+        # silently dropping either observation would lose subtitle content.
+        current_start = None
+        next_start = None
+        for cue in reversed(merged):
+            if cue["start_ms"] != current_start:
+                next_start = current_start
+                current_start = cue["start_ms"]
+            if next_start is not None:
+                cue["end_ms"] = min(cue["end_ms"], next_start)
+        result.extend(cue for cue in merged if cue["end_ms"] > cue["start_ms"])
+
+    result.sort(key=lambda cue: (cue["start_ms"], cue["order"]))
+    return result
+
+
 def build_cues(
     groups: list[dict],
     video_duration: float,
@@ -125,49 +168,81 @@ def build_cues(
     merge_gap: float = 0.45,
     min_duration: float = 0.25,
 ) -> list[dict]:
-    cues: list[dict] = []
-    for group in groups:
+    try:
+        duration = float(video_duration)
+        gap = float(merge_gap)
+        minimum = float(min_duration)
+        confidence_floor = float(min_conf)
+    except (TypeError, ValueError):
+        return []
+    if not all(math.isfinite(value) for value in (duration, gap, minimum, confidence_floor)) or duration <= 0:
+        return []
+
+    duration_ms = _timestamp_ms(duration)
+    if duration_ms <= 0:
+        return []
+    gap_ms = max(0, _timestamp_ms(max(0.0, gap)))
+    minimum = max(0.0, minimum)
+    candidates: list[dict] = []
+
+    for order, group in enumerate(groups):
         lines = []
         for line in group.get("lines", []):
             text = clean_text(line.get("text", ""))
-            if not text or line.get("conf", 0.0) < min_conf or not is_meaningful(text):
+            try:
+                confidence = float(line.get("conf", 0.0))
+            except (TypeError, ValueError):
+                continue
+            if not text or not math.isfinite(confidence) or confidence < confidence_floor or not is_meaningful(text):
                 continue
             lines.append(text)
         if not lines:
             continue
-        start = max(0.0, float(group["start"]))
-        end = min(float(video_duration), float(group["end"]))
-        if end - start < min_duration:
-            end = min(float(video_duration), start + min_duration)
+        try:
+            raw_start = float(group["start"])
+            raw_end = float(group["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not math.isfinite(raw_start) or not math.isfinite(raw_end) or raw_start >= duration or raw_end <= raw_start:
+            continue
+
+        start = max(0.0, raw_start)
+        end = min(duration, raw_end)
         if end <= start:
             continue
-        text = "\n".join(lines)
-        region = group.get("region")
-        if (
-            cues and cues[-1]["text"] == text
-            and cues[-1].get("_region") == region
-            and start - cues[-1]["end"] <= merge_gap
-        ):
-            cues[-1]["end"] = round(end, 3)
-            continue
-        cues.append({"start": round(start, 3), "end": round(end, 3), "text": text, "_region": region})
+        if end - start < minimum:
+            end = min(duration, start + minimum)
 
-    # Cue cùng vùng không được chồng giờ lên nhau; cue khác vùng (trên/dưới)
-    # hoàn toàn có thể chạy song song nên giữ nguyên.
-    fixed: list[dict] = []
-    for cue in cues:
-        if fixed and fixed[-1].get("_region") == cue.get("_region") and fixed[-1]["end"] > cue["start"]:
-            fixed[-1]["end"] = round(max(fixed[-1]["start"] + 0.2, cue["start"]), 3)
-        fixed.append(cue)
+        start_ms = max(0, min(duration_ms, _timestamp_ms(start)))
+        end_ms = max(0, min(duration_ms, _timestamp_ms(end)))
+        if end_ms <= start_ms:
+            # SRT/VTT have millisecond resolution. Preserve a real positive cue
+            # as one millisecond, shifting its start by at most 1 ms if needed;
+            # never create a zero-length cue or extend beyond video duration.
+            if start_ms >= duration_ms:
+                start_ms = duration_ms - 1
+            end_ms = min(duration_ms, start_ms + 1)
+        if end_ms <= start_ms:
+            continue
+        candidates.append({
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "text": "\n".join(lines),
+            "region": group.get("region"),
+            "order": order,
+        })
+
+    fixed = _normalise_region_cues(candidates, gap_ms)
     return [
-        {"start": c["start"], "end": c["end"], "text": c["text"], "region": c.get("_region")}
-        for c in fixed
+        {"start": cue["start_ms"] / 1000.0, "end": cue["end_ms"] / 1000.0,
+         "text": cue["text"], "region": cue["region"]}
+        for cue in fixed
     ]
 
 
 def format_timestamp(seconds: float, sep: str = ",") -> str:
     seconds = max(0.0, float(seconds))
-    total_ms = int(round(seconds * 1000))
+    total_ms = _timestamp_ms(seconds)
     h, rem = divmod(total_ms, 3_600_000)
     m, rem = divmod(rem, 60_000)
     s, ms = divmod(rem, 1000)
