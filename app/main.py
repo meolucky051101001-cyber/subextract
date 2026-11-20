@@ -189,6 +189,7 @@ class CueBody(BaseModel):
     text: str
     trans: str = ""
     region: int | None = None
+    id: str | None = None
 
 
 class CuesBody(BaseModel):
@@ -208,10 +209,15 @@ class SettingsBody(BaseModel):
     tool_v1_url: str | None = None
 
 
+_cue_write_lock = threading.RLock()
+
+
 class RetranslateBody(BaseModel):
-    index: int
+    index: int | None = None
+    cue_id: str | None = None
     text: str | None = None
     target: str | None = None
+    persist: bool = True
 
 
 class HandoffBody(BaseModel):
@@ -412,20 +418,15 @@ async def create_job(file: UploadFile = File(...)):
 
 
 def _run_job_thread(job: Job, params: RunParams) -> None:
-    job.status = "running"
-    job.stage = "detect"
-    job.progress = 0.0
-    job.message = "Bắt đầu xử lý…"
-    job.error = ""
-    job.save()
-    gpu = gpu_info()["available"]
-
     def progress(stage: str, value: float, message: str) -> None:
         job.stage = stage
         job.progress = value
         job.message = message
 
     try:
+        with _cue_write_lock:
+            job.save()
+        gpu = gpu_info()["available"]
         result = run_pipeline(
             video_path=job.video_path,
             work_dir=job.work_dir,
@@ -481,19 +482,19 @@ def _run_job_thread(job: Job, params: RunParams) -> None:
             job.message = "Lỗi khi xử lý video."
             (job.work_dir / "error.log").write_text(traceback.format_exc(), encoding="utf-8")
     finally:
-        job.save()
-        if job.run_lock.locked():
+        with _cue_write_lock:
             try:
+                job.save()
+            finally:
                 job.run_lock.release()
-            except RuntimeError:
-                pass
 
 
 @app.post("/api/jobs/{job_id}/start")
 def start_job(job_id: str, body: StartBody):
     job = _get_job(job_id)
-    if job.status == "running":
-        raise HTTPException(status_code=409, detail="Job đang chạy")
+    with _cue_write_lock:
+        if job.status == "running" or job.run_lock.locked():
+            raise HTTPException(status_code=409, detail="Job đang chạy")
 
     rois = _parse_rois(body.roi)
 
@@ -529,29 +530,44 @@ def start_job(job_id: str, body: StartBody):
         source_name=job.filename,
     )
 
-    job.cancel_event.clear()
-    job.cues = []
-    job.stats = {}
-    job.params = {
-        "roi": [list(r) for r in rois],
-        "sample_fps": params.sample_fps,
-        "langs": params.langs,
-        "min_conf": params.min_conf,
-        "translate_to": params.translate_to,
-        "translate_model": params.translate_model if translate_to else "",
-        "dub": dub_enabled,
-        "dub_voice": dub_voice if dub_enabled else "",
-        "dub_output_dir": dub_output_dir if dub_enabled else "",
-    }
-    if not job.run_lock.acquire(blocking=False):
-        raise HTTPException(status_code=409, detail="Job đang chạy")
-    try:
-        thread = threading.Thread(target=_run_job_thread, args=(job, params), daemon=True)
-        thread.start()
-    except Exception:
-        job.run_lock.release()
-        raise
-    return {"ok": True, "job": job.snapshot()}
+    with _cue_write_lock:
+        # Reserve the run before clearing cues, including the thread startup window.
+        if job.status == "running" or not job.run_lock.acquire(blocking=False):
+            raise HTTPException(status_code=409, detail="Job đang chạy")
+        previous = {name: getattr(job, name) for name in (
+            "cues", "stats", "params", "status", "stage", "progress", "message", "error",
+        )}
+        was_cancelled = job.cancel_event.is_set()
+        try:
+            job.cancel_event.clear()
+            job.cues = []
+            job.stats = {}
+            job.params = {
+                "roi": [list(r) for r in rois],
+                "sample_fps": params.sample_fps,
+                "langs": params.langs,
+                "min_conf": params.min_conf,
+                "translate_to": params.translate_to,
+                "translate_model": params.translate_model if translate_to else "",
+                "dub": dub_enabled,
+                "dub_voice": dub_voice if dub_enabled else "",
+                "dub_output_dir": dub_output_dir if dub_enabled else "",
+            }
+            job.status = "running"
+            job.stage = "detect"
+            job.progress = 0.0
+            job.message = "Bắt đầu xử lý…"
+            job.error = ""
+            thread = threading.Thread(target=_run_job_thread, args=(job, params), daemon=True)
+            thread.start()
+        except Exception:
+            for name, value in previous.items():
+                setattr(job, name, value)
+            if was_cancelled:
+                job.cancel_event.set()
+            job.run_lock.release()
+            raise
+        return {"ok": True, "job": job.snapshot()}
 
 
 @app.post("/api/jobs/{job_id}/cancel")
@@ -591,54 +607,81 @@ async def job_events(job_id: str, request: Request):
 @app.put("/api/jobs/{job_id}/cues")
 def update_cues(job_id: str, body: CuesBody):
     job = _get_job(job_id)
-    if job.status == "running":
-        raise HTTPException(status_code=409, detail="Job đang chạy, chưa thể sửa")
     cues = []
+    seen_ids = set()
     for cue in sorted(body.cues, key=lambda c: c.start):
         text = cue.text.strip()
         if not text:
             continue
         start = max(0.0, float(cue.start))
         end = max(start + 0.05, float(cue.end))
+        cue_id = (cue.id or "").strip()
+        if not cue_id or len(cue_id) > 128 or cue_id in seen_ids:
+            cue_id = uuid.uuid4().hex
+            while cue_id in seen_ids:
+                cue_id = uuid.uuid4().hex
+        seen_ids.add(cue_id)
         cues.append({
+            "id": cue_id,
             "start": round(start, 3),
             "end": round(end, 3),
             "text": text,
             "trans": cue.trans.strip(),
             "region": cue.region,
         })
-    job.cues = cues
-    job.save()
-    return {"ok": True, "count": len(cues)}
+    with _cue_write_lock:
+        if job.status == "running" or job.run_lock.locked():
+            raise HTTPException(status_code=409, detail="Job đang chạy, chưa thể sửa")
+        previous = job.cues
+        job.cues = cues
+        try:
+            job.save()
+        except Exception:
+            job.cues = previous
+            raise
+    return {"ok": True, "count": len(cues), "cues": cues}
 
 
 @app.post("/api/jobs/{job_id}/retranslate")
 def retranslate_cue(job_id: str, body: RetranslateBody):
     job = _get_job(job_id)
-    if job.status == "running":
-        raise HTTPException(status_code=409, detail="Job đang chạy, hãy hủy hoặc chờ xong")
-    if not job.cues:
-        raise HTTPException(status_code=400, detail="Job chưa có cue để dịch")
-    if body.index < 0 or body.index >= len(job.cues):
-        raise HTTPException(status_code=400, detail="Chỉ số cue không hợp lệ")
-    cue = job.cues[body.index]
-    text = (body.text if body.text is not None else str(cue.get("text") or "")).strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="Cue không có nội dung để dịch")
+    with _cue_write_lock:
+        if job.status == "running" or job.run_lock.locked():
+            raise HTTPException(status_code=409, detail="Job đang chạy, hãy hủy hoặc chờ xong")
+        if not job.cues:
+            raise HTTPException(status_code=400, detail="Job chưa có cue để dịch")
+        if body.cue_id is not None:
+            cue_id = body.cue_id.strip()
+            matches = [i for i, cue in enumerate(job.cues) if cue.get("id") == cue_id]
+            if not cue_id or len(matches) != 1:
+                raise HTTPException(status_code=400, detail="ID cue không hợp lệ")
+            index = matches[0]
+        else:
+            index = body.index
+            if index is None or index < 0 or index >= len(job.cues):
+                raise HTTPException(status_code=400, detail="Chỉ số cue không hợp lệ")
+        original_cues = job.cues
+        cue = original_cues[index]
+        snapshot = dict(cue)
+        text = (body.text if body.text is not None else str(snapshot.get("text") or "")).strip()
+        if not text:
+            raise HTTPException(status_code=400, detail="Cue không có nội dung để dịch")
 
-    target = (body.target or "").strip().lower()
-    if not target:
-        target = str((job.params or {}).get("translate_to") or "").lower()
-    if target not in {"vi", "en", "zh"}:
-        raise HTTPException(status_code=400, detail="Chưa chọn ngôn ngữ đích (vi/en/zh)")
+        target = (body.target or "").strip().lower()
+        if not target:
+            target = str((job.params or {}).get("translate_to") or "").strip().lower()
+        if target not in {"vi", "en", "zh"}:
+            raise HTTPException(status_code=400, detail="Chưa chọn ngôn ngữ đích (vi/en/zh)")
 
     keys = get_gemini_keys()
     if not keys:
         raise HTTPException(status_code=400, detail="Chưa cấu hình Gemini API key trong Cài đặt")
-    model = normalize_model(load_settings().get("translate_model"))
-    glossary = load_settings().get("glossary")
+    settings_data = load_settings()
+    model = normalize_model(settings_data.get("translate_model"))
+    glossary = settings_data.get("glossary")
 
-    tmp = {"start": cue.get("start"), "end": cue.get("end"), "text": text, "trans": ""}
+    # Gemini runs outside the lock so edits and other jobs remain responsive.
+    tmp = {"start": snapshot.get("start"), "end": snapshot.get("end"), "text": text, "trans": ""}
     result = translate_cues([tmp], target=target, api_key=keys, model=model, glossary=glossary)
     trans = str(tmp.get("trans") or "").strip()
     if not trans:
@@ -646,9 +689,23 @@ def retranslate_cue(job_id: str, body: RetranslateBody):
             raise HTTPException(status_code=400, detail="Cue này đã ở ngôn ngữ đích, không cần dịch")
         raise HTTPException(status_code=502, detail=result.get("error") or "Không dịch được cue này")
 
-    cue["trans"] = trans
-    job.save()
-    return {"ok": True, "index": body.index, "trans": trans}
+    if body.persist:
+        with _cue_write_lock:
+            # A PUT or rerun replaces the list even if its contents later match.
+            if (job.status == "running" or job.run_lock.locked()
+                    or job.cues is not original_cues
+                    or index >= len(job.cues) or job.cues[index] is not cue
+                    or cue != snapshot):
+                raise HTTPException(status_code=409, detail="Cue đã thay đổi trong lúc dịch, hãy thử lại")
+            updated = {**snapshot, "trans": trans}
+            job.cues[index] = updated
+            try:
+                job.save()
+            except Exception:
+                job.cues[index] = cue
+                raise
+    return {"ok": True, "index": index, "cue_id": snapshot.get("id"),
+            "trans": trans, "persisted": body.persist}
 
 
 _handoff_lock = threading.Lock()

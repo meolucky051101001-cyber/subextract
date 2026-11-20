@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -26,6 +28,7 @@ class Job:
     cancel_event: threading.Event = field(default_factory=threading.Event)
     run_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     created_at: float = field(default_factory=time.time)
+    _save_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     @property
     def preview_path(self) -> Path:
@@ -52,6 +55,10 @@ class Job:
         return data
 
     def save(self) -> None:
+        with self._save_lock:
+            self._save_atomic()
+
+    def _save_atomic(self) -> None:
         payload = {
             "id": self.id,
             "filename": self.filename,
@@ -65,9 +72,21 @@ class Job:
             "created_at": self.created_at,
             "preview_status": "ready" if self.preview_path.exists() else self.preview_status,
         }
-        (self.work_dir / "job.json").write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        content = json.dumps(payload, ensure_ascii=False, indent=2)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=self.work_dir,
+                prefix=".job-", suffix=".tmp", delete=False,
+            ) as output:
+                temporary = Path(output.name)
+                output.write(content)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, self.work_dir / "job.json")
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
 
 class JobStore:

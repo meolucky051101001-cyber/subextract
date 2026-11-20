@@ -116,6 +116,9 @@ const state = {
   drag: null,
   events: null,
   saveTimer: null,
+  editorSession: 0,
+  resultPending: false,
+  cueSave: null,
   pollTimer: null,
   previewTimer: null,
   activeCue: -1,
@@ -470,18 +473,21 @@ function pollHandoff(delay = 2000) {
   stopHandoffPolling();
   if (!state.job) return;
   const jobId = state.job.id;
+  const context = editorContext();
   state.handoffTimer = setTimeout(async () => {
     state.handoffTimer = null;
-    if (!state.job || state.job.id !== jobId) return;
+    if (!isEditorSession(context)) return;
     try {
       const res = await fetch(`/api/jobs/${jobId}/handoff`);
       const data = await res.json().catch(() => ({}));
+      if (!isEditorSession(context)) return;
       if (res.ok) {
         renderHandoff(data.handoff);
         return;
       }
       state.handoffFails += 1;
     } catch (err) {
+      if (!isEditorSession(context)) return;
       state.handoffFails += 1;
     }
     // Tool V1 đang bận render có thể chậm phản hồi: thử lại thưa dần rồi dừng.
@@ -492,33 +498,37 @@ function pollHandoff(delay = 2000) {
 
 async function sendHandoff() {
   if (!state.job || state.running || state.handoffSending) return;
+  const context = editorContext();
   const translated = state.cues.filter((cue) => (cue.trans || "").trim()).length;
   if (!translated && !window.confirm(
-    "Chưa có bản dịch tiếng Việt cho video này.\n\nTool V1 vẫn render và che phụ đề gốc nhưng sẽ không có giọng đọc Việt. Gửi tiếp?"
+    "Chưa có bản dịch tiếng Việt. Gửi tiếp sang Tool V1 để render và che phụ đề gốc?"
   )) return;
-  if (state.saveTimer) await saveCues(true);
-
   state.handoffSending = true;
   els.handoffBtn.disabled = true;
   els.handoffBtn.textContent = "Đang gửi…";
   try {
-    const res = await fetch(`/api/jobs/${state.job.id}/handoff`, {
+    if (!(await saveCues()) || !isCurrentEditor(context)) return;
+    const res = await fetch("/api/jobs/" + context.jobId + "/handoff", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ target_lang: els.translateTo.value || null }),
     });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.detail || `Tool V1 không phản hồi (${res.status})`);
+    if (!isCurrentEditor(context)) return;
+    if (!res.ok) throw new Error(data.detail || "Tool V1 không phản hồi (" + res.status + ")");
     renderHandoff(data.handoff);
     showToast("Đã gửi sang Tool V1 — đang lồng tiếng và che phụ đề gốc", "success");
   } catch (err) {
+    if (!isCurrentEditor(context)) return;
     const message = String(err.message || err).slice(0, 200);
-    // Lần gửi hỏng: bỏ trạng thái cũ (có thể còn hiện "Hoàn tất" của lần trước) và báo lỗi ngay trên panel.
     renderHandoff({ ...(state.handoff || {}), status: "error", stage: "Không gửi được sang Tool V1", error: message });
     showToast(message, "error");
   } finally {
-    state.handoffSending = false;
-    els.handoffBtn.disabled = state.running || Boolean(state.handoff && HANDOFF_ACTIVE.includes(state.handoff.status));
+    if (isCurrentEditor(context)) {
+      state.handoffSending = false;
+      els.handoffBtn.disabled = Boolean(state.handoff && HANDOFF_ACTIVE.includes(state.handoff.status));
+      if (!state.handoff) els.handoffBtn.textContent = "Gửi sang Tool V1 · lồng tiếng + che sub";
+    }
   }
 }
 
@@ -572,6 +582,13 @@ function uploadFile(file) {
 
 function openJob(job, restored) {
   closeEvents();
+  clearTimeout(state.saveTimer);
+  state.saveTimer = null;
+  state.editorSession += 1;
+  state.resultPending = false;
+  state.cueSave = null;
+  state.retranslating = false;
+  state.handoffSending = false;
   state.job = job;
   state.cues = job.cues || [];
   state.activeCue = -1;
@@ -643,7 +660,7 @@ function openJob(job, restored) {
   });
 }
 
-function startJob() {
+async function startJob() {
   if (!state.job || state.running) return;
   const langs = getLangs();
   if (!langs.length) {
@@ -657,15 +674,15 @@ function startJob() {
     return;
   }
 
-  state.cues = [];
-  state.showTrans = Boolean(translateTo);
-  state.untranslated = [];
-  state.undoStack = [];
-  updateUndoUI();
-  updateExportUI();
-  updateTransWarn();
+  const context = editorContext();
+  if (!(await saveCues()) || !isCurrentEditor(context)) return;
+  state.editorSession += 1;
+  state.resultPending = false;
+  state.cueSave = null;
+  state.retranslating = false;
+  state.handoffSending = false;
+  // Keep the previous result until the server accepts the new run.
   els.resultCard.classList.add("hidden");
-  els.cueList.innerHTML = "";
   els.saveState.textContent = "";
   els.progressPanel.classList.remove("hidden");
   els.progressBar.style.width = "0%";
@@ -673,8 +690,9 @@ function startJob() {
   els.progressPct.textContent = "0%";
   els.progressMsg.textContent = "";
   els.statsLine.textContent = "";
-  renderHandoff(null);
   setRunning(true);
+  const runContext = editorContext();
+  let startRejected = false;
 
   fetch(`/api/jobs/${state.job.id}/start`, {
     method: "POST",
@@ -689,17 +707,34 @@ function startJob() {
     }),
   })
     .then(async (res) => {
+      if (!isEditorSession(runContext)) return;
       if (!res.ok) {
+        startRejected = res.status !== 409;
         const body = await res.json().catch(() => ({}));
         throw new Error(body.detail || "Không bắt đầu được job");
       }
+      if (!isEditorSession(runContext)) return;
+      state.cues = [];
+      state.showTrans = Boolean(translateTo);
+      state.untranslated = [];
+      state.undoStack = [];
+      updateUndoUI();
+      updateExportUI();
+      updateTransWarn();
+      els.cueList.innerHTML = "";
+      renderHandoff(null);
       listenJob();
     })
     .catch((err) => {
+      if (!isEditorSession(runContext)) return;
       setRunning(false);
+      // A lost response may hide a successfully started run. Do not PUT the
+      // previous result over the server result until a reload reconciles it.
+      state.resultPending = !startRejected;
+      els.resultCard.classList.toggle("hidden", !state.cues.length);
       els.stageLabel.textContent = "Lỗi";
       els.progressMsg.textContent = err.message;
-      showToast(err.message, "error");
+      showToast(startRejected ? err.message : "Chưa xác nhận được trạng thái xử lý. Tải lại trang để kiểm tra kết quả.", "error");
     });
 }
 
@@ -790,9 +825,11 @@ function closeEvents() {
 function listenJob() {
   closeEvents();
   if (!state.job) return;
+  const context = editorContext();
   const es = new EventSource(`/api/jobs/${state.job.id}/events`);
   state.events = es;
   es.onmessage = (event) => {
+    if (!isEditorSession(context)) return;
     let snapshot;
     try {
       snapshot = JSON.parse(event.data);
@@ -807,7 +844,7 @@ function listenJob() {
     }
   };
   es.onerror = () => {
-    if (!state.running) return;
+    if (!isEditorSession(context) || !state.running) return;
     es.close();
     state.events = null;
     pollJob();
@@ -816,12 +853,14 @@ function listenJob() {
 
 function pollJob() {
   if (!state.job || state.pollTimer) return;
+  const context = editorContext();
   const tick = async () => {
     state.pollTimer = null;
-    if (!state.job) return;
+    if (!isEditorSession(context)) return;
     try {
-      const res = await fetch(`/api/jobs/${state.job.id}`);
+      const res = await fetch(`/api/jobs/${context.jobId}`);
       const snapshot = await res.json();
+      if (!isEditorSession(context)) return;
       if (res.ok) {
         updateProgress(snapshot);
         if (["done", "error", "cancelled"].includes(snapshot.status)) {
@@ -830,19 +869,26 @@ function pollJob() {
         }
       }
     } catch (err) {}
-    if (state.running) state.pollTimer = setTimeout(tick, 1200);
+    if (isEditorSession(context) && state.running) state.pollTimer = setTimeout(tick, 1200);
   };
   state.pollTimer = setTimeout(tick, 800);
 }
 
 async function onJobFinished(snapshot) {
-  setRunning(false);
+  const context = editorContext();
+  if (!isEditorSession(context) || (snapshot.id && snapshot.id !== context.jobId)) return;
   if (snapshot.status === "done") {
+    state.resultPending = true;
     try {
       const res = await fetch(`/api/jobs/${state.job.id}`);
       const job = await res.json();
+      if (!isEditorSession(context)) return;
+      if (!res.ok) throw new Error("result failed");
       state.job = job;
+      state.cueSave = null;
       state.cues = job.cues || [];
+      state.resultPending = false;
+      setRunning(false);
       state.showTrans = Boolean(
         (job.params && job.params.translate_to) || state.cues.some((cue) => cue.trans)
       );
@@ -876,13 +922,18 @@ async function onJobFinished(snapshot) {
         );
       }
     } catch (err) {
-      showToast("Không tải được kết quả", "error");
+      if (isEditorSession(context)) {
+        setRunning(false);
+        showToast("Không tải được kết quả. Tải lại trang để thử lại.", "error");
+      }
     }
   } else if (snapshot.status === "cancelled") {
+    setRunning(false);
     els.stageLabel.textContent = "Đã hủy";
     els.progressMsg.textContent = "Bạn có thể chạy lại với cài đặt khác.";
     showToast("Đã hủy xử lý");
   } else if (snapshot.status === "error") {
+    setRunning(false);
     els.stageLabel.textContent = "Lỗi";
     els.progressMsg.textContent = snapshot.error || snapshot.message || "Xử lý thất bại";
     showToast(snapshot.error || "Xử lý thất bại", "error");
@@ -898,6 +949,10 @@ function cancelJob() {
 
 function resetWorkspace() {
   closeEvents();
+  state.editorSession += 1;
+  state.resultPending = false;
+  state.cueSave = null;
+  state.handoffSending = false;
   clearTimeout(state.saveTimer);
   if (state.previewTimer) clearTimeout(state.previewTimer);
   state.job = null;
@@ -1186,40 +1241,111 @@ function replaceAllInCues() {
   showToast(count ? `Đã thay ${count} chỗ` : "Không tìm thấy nội dung nào khớp", count ? "success" : "error");
 }
 
-function markDirty() {
-  els.saveState.textContent = "Chưa lưu…";
-  clearTimeout(state.saveTimer);
-  state.saveTimer = setTimeout(saveCues, 700);
+function editorContext() {
+  return { jobId: state.job && state.job.id, session: state.editorSession || 0 };
 }
 
-async function saveCues(immediate = false) {
+function isEditorSession(context) {
+  return Boolean(context.jobId && state.job && state.job.id === context.jobId
+    && (state.editorSession || 0) === context.session);
+}
+
+function isCurrentEditor(context) {
+  return isEditorSession(context) && !state.running && !state.resultPending;
+}
+
+let cueIdSequence = 0;
+function ensureCueIds() {
+  const seen = new Set();
+  for (const cue of state.cues) {
+    if (!cue.id || seen.has(cue.id)) {
+      cue.id = globalThis.crypto && typeof globalThis.crypto.randomUUID === "function"
+        ? globalThis.crypto.randomUUID()
+        : "cue-" + Date.now().toString(36) + "-" + (++cueIdSequence).toString(36);
+    }
+    seen.add(cue.id);
+  }
+}
+
+function saveStateFor(jobId) {
+  const session = state.editorSession || 0;
+  if (!state.cueSave || state.cueSave.jobId !== jobId || state.cueSave.session !== session) {
+    state.cueSave = { jobId, session, revision: 1, savedRevision: 0, inFlight: null };
+  }
+  return state.cueSave;
+}
+
+function markDirty() {
   if (!state.job) return;
+  const context = editorContext();
+  saveStateFor(context.jobId).revision += 1;
+  els.saveState.textContent = "Chưa lưu…";
+  clearTimeout(state.saveTimer);
+  state.saveTimer = setTimeout(() => {
+    if (isCurrentEditor(context)) void saveCues();
+  }, 700);
+}
+
+async function saveCues() {
+  const context = editorContext();
+  if (!isCurrentEditor(context)) return false;
   clearTimeout(state.saveTimer);
   state.saveTimer = null;
-  const cues = state.cues
-    .filter((cue) => cue.text.trim().length > 0)
-    .map((cue) => ({
-      start: cue.start,
-      end: cue.end,
-      text: cue.text,
-      trans: cue.trans || "",
-      region: Number.isInteger(cue.region) ? cue.region : null,
-    }));
-  els.saveState.textContent = "Đang lưu…";
+  const saveState = saveStateFor(context.jobId);
+  if (saveState.inFlight) return saveState.inFlight;
+  if (saveState.savedRevision >= saveState.revision) return true;
+
+  const flight = (async () => {
+    while (saveState.savedRevision < saveState.revision) {
+      if (!isCurrentEditor(context)) return false;
+      const revision = saveState.revision;
+      ensureCueIds();
+      const cues = state.cues
+        .filter((cue) => cue.text.trim().length > 0)
+        .map((cue) => ({
+          id: cue.id,
+          start: cue.start,
+          end: cue.end,
+          text: cue.text,
+          trans: cue.trans || "",
+          region: Number.isInteger(cue.region) ? cue.region : null,
+        }));
+      els.saveState.textContent = "Đang lưu…";
+      try {
+        const res = await fetch("/api/jobs/" + context.jobId + "/cues", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cues }),
+        });
+        if (!res.ok) throw new Error("save failed");
+      } catch (err) {
+        if (isCurrentEditor(context)) {
+          els.saveState.textContent = "Lưu thất bại";
+          showToast("Không lưu được chỉnh sửa", "error");
+        }
+        return false;
+      }
+      saveState.savedRevision = revision;
+      if (!isCurrentEditor(context)) return false;
+      if (saveState.revision === revision) {
+        els.saveState.textContent = "Đã lưu";
+        setTimeout(() => {
+          if (isCurrentEditor(context) && saveState.savedRevision === revision
+              && saveState.revision === revision && els.saveState.textContent === "Đã lưu") {
+            els.saveState.textContent = "";
+          }
+        }, 2200);
+        return true;
+      }
+      // A newer edit arrived during the PUT; persist it before releasing callers.
+    }
+    return true;
+  })();
+  saveState.inFlight = flight;
   try {
-    const res = await fetch(`/api/jobs/${state.job.id}/cues`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cues }),
-    });
-    if (!res.ok) throw new Error("save failed");
-    els.saveState.textContent = "Đã lưu";
-    setTimeout(() => {
-      if (els.saveState.textContent === "Đã lưu") els.saveState.textContent = "";
-    }, 2200);
-  } catch (err) {
-    els.saveState.textContent = "Lưu thất bại";
-    showToast("Không lưu được chỉnh sửa", "error");
+    return await flight;
+  } finally {
+    if (saveState.inFlight === flight) saveState.inFlight = null;
   }
 }
 
@@ -1463,39 +1589,55 @@ function deleteCue(event) {
   markDirty();
 }
 
-async function retranslateCueCore(index) {
-  const res = await fetch(`/api/jobs/${state.job.id}/retranslate`, {
+function cueFingerprint(cue) {
+  return JSON.stringify([cue.id, cue.start, cue.end, cue.text, cue.trans || "", cue.region]);
+}
+
+async function retranslateCueCore(cueOrIndex, context = editorContext()) {
+  const cue = typeof cueOrIndex === "number" ? state.cues[cueOrIndex] : cueOrIndex;
+  if (!cue || !isCurrentEditor(context)) throw new Error("Video hoặc cue đã thay đổi");
+  if (!(await saveCues())) throw new Error("Không lưu được chỉnh sửa; chưa gửi dịch lại");
+  if (!isCurrentEditor(context) || !state.cues.includes(cue)) throw new Error("Video hoặc cue đã thay đổi");
+  const fingerprint = cueFingerprint(cue);
+  const target = els.translateTo.value || (state.job.params || {}).translate_to || null;
+  const res = await fetch("/api/jobs/" + context.jobId + "/retranslate", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ index }),
+    body: JSON.stringify({ cue_id: cue.id, text: cue.text.trim(), target, persist: false }),
   });
   const data = await res.json().catch(() => ({}));
-  if (res.ok && data.ok) {
-    const cue = state.cues[index];
-    if (cue) cue.trans = data.trans || "";
-    const ta = $(`.cue[data-index="${index}"] .cue-trans`);
-    if (ta) {
-      ta.value = data.trans || "";
-      autoGrow(ta);
-    }
-    state.untranslated = state.untranslated.filter((i) => i !== index);
-    updateTransWarn();
-    return;
+  if (!isCurrentEditor(context) || !state.cues.includes(cue)
+      || cueFingerprint(cue) !== fingerprint
+      || target !== (els.translateTo.value || (state.job.params || {}).translate_to || null)) {
+    throw new Error("Cue đã thay đổi trong khi dịch; hãy dịch lại nội dung mới");
   }
-  throw new Error(data.detail || "Dịch lại thất bại");
+  if (!res.ok || !data.ok) throw new Error(data.detail || "Dịch lại thất bại");
+  const index = state.cues.indexOf(cue);
+  cue.trans = data.trans || "";
+  const ta = $('.cue[data-index="' + index + '"] .cue-trans');
+  if (ta) {
+    ta.value = cue.trans;
+    autoGrow(ta);
+  }
+  state.untranslated = state.untranslated.filter((i) => i !== index);
+  updateTransWarn();
+  markDirty();
+  if (!(await saveCues())) throw new Error("Đã dịch nhưng chưa lưu được; bản dịch còn trong editor");
 }
 
 async function retranslateCue(index, btn) {
   if (!state.job || state.running || state.retranslating) return;
-  await saveCues(true);
+  const context = editorContext();
+  state.retranslating = true;
   btn.disabled = true;
   btn.classList.add("spin");
   try {
-    await retranslateCueCore(index);
-    showToast("Đã dịch lại cue", "success");
+    await retranslateCueCore(index, context);
+    if (isCurrentEditor(context)) showToast("Đã dịch lại cue", "success");
   } catch (err) {
-    showToast(err.message || "Dịch lại thất bại", "error");
+    if (isCurrentEditor(context)) showToast(err.message || "Dịch lại thất bại", "error");
   } finally {
+    if (isCurrentEditor(context)) state.retranslating = false;
     btn.disabled = false;
     btn.classList.remove("spin");
   }
@@ -1503,29 +1645,36 @@ async function retranslateCue(index, btn) {
 
 async function retranslateMissing() {
   if (!state.job || state.running || state.retranslating) return;
-  await saveCues(true);
+  const context = editorContext();
   state.retranslating = true;
   els.retransAllBtn.disabled = true;
-  const list = [...state.untranslated];
   let okCount = 0;
   let failed = 0;
-  for (let i = 0; i < list.length; i += 1) {
-    els.retransAllBtn.textContent = `Đang dịch lại ${i + 1}/${list.length}…`;
-    try {
-      await retranslateCueCore(list[i]);
-      okCount += 1;
-    } catch (err) {
-      failed += 1;
+  try {
+    if (!(await saveCues()) || !isCurrentEditor(context)) return;
+    const list = state.untranslated.map((index) => state.cues[index]).filter(Boolean);
+    for (let i = 0; i < list.length; i += 1) {
+      if (!isCurrentEditor(context)) return;
+      els.retransAllBtn.textContent = "Đang dịch lại " + (i + 1) + "/" + list.length + "…";
+      try {
+        await retranslateCueCore(list[i], context);
+        okCount += 1;
+      } catch (err) {
+        if (!isCurrentEditor(context)) return;
+        failed += 1;
+      }
+    }
+    if (isCurrentEditor(context)) {
+      updateTransWarn();
+      showToast("Dịch lại xong: " + okCount + " cue" + (failed ? " · lỗi " + failed : ""), failed ? "error" : "success");
+    }
+  } finally {
+    if (isCurrentEditor(context)) {
+      state.retranslating = false;
+      els.retransAllBtn.disabled = false;
+      els.retransAllBtn.textContent = "Dịch lại chỗ thiếu";
     }
   }
-  state.retranslating = false;
-  els.retransAllBtn.disabled = false;
-  els.retransAllBtn.textContent = "Dịch lại chỗ thiếu";
-  updateTransWarn();
-  showToast(
-    `Dịch lại xong: ${okCount} cue` + (failed ? ` · lỗi ${failed}` : ""),
-    failed ? "error" : "success"
-  );
 }
 
 function handleCueBlur(event) {
@@ -1574,7 +1723,8 @@ async function exportCues(format) {
     showToast("Chưa có phụ đề để xuất", "error");
     return;
   }
-  await saveCues(true);
+  const context = editorContext();
+  if (!(await saveCues()) || !isCurrentEditor(context)) return;
   const variant = state.showTrans ? els.exportVariant.value : "original";
   const link = document.createElement("a");
   link.href = `/api/jobs/${state.job.id}/export?format=${format}&variant=${variant}&v=${Date.now()}`;
@@ -1648,10 +1798,13 @@ function bindEvents() {
     if (file) uploadFile(file);
   });
 
-  els.newVideoBtn.addEventListener("click", () => {
+  els.newVideoBtn.addEventListener("click", async () => {
+    const context = editorContext();
     if (state.running) {
       if (!window.confirm("Video đang được xử lý. Dừng lại và chọn video khác?")) return;
       cancelJob();
+    } else if (!state.resultPending && state.job && (!(await saveCues()) || !isCurrentEditor(context))) {
+      return;
     }
     resetWorkspace();
   });
