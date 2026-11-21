@@ -67,6 +67,10 @@ const els = {
   toolV1Url: $("#toolV1Url"),
   saveToolV1Btn: $("#saveToolV1Btn"),
   toolV1State: $("#toolV1State"),
+  toolV1Connection: $("#toolV1Connection"),
+  toolV1Dashboard: $("#toolV1Dashboard"),
+  checkToolV1Btn: $("#checkToolV1Btn"),
+  handoffBlur: $("#handoffBlur"),
   handoffBtn: $("#handoffBtn"),
   handoffPanel: $("#handoffPanel"),
   handoffStage: $("#handoffStage"),
@@ -130,6 +134,8 @@ const state = {
   dubOutputDir: "D:\\banve",
   dubVoiceLabel: "Chí Mai",
   toolV1Url: "http://127.0.0.1:8088",
+  toolV1Connected: null,
+  toolV1CheckSeq: 0,
   handoff: null,
   handoffTimer: null,
   handoffSending: false,
@@ -296,10 +302,32 @@ function updateExportUI() {
 }
 
 function updateTransWarn() {
-  const count = state.showTrans ? state.untranslated.length : 0;
+  // Preserve backend language exemptions while following stable cue identities.
+  ensureCueIds();
+  const missing = new Set(state.untranslated);
+  state.untranslated = state.showTrans ? state.cues
+    .filter((cue) => missing.has(cue.id) && cue.text.trim() && !(cue.trans || "").trim())
+    .map((cue) => cue.id) : [];
+  const count = state.untranslated.length;
   els.transWarn.textContent = count > 0 ? `${count} cue chưa dịch` : "";
   els.transWarn.classList.toggle("hidden", count === 0);
   els.retransAllBtn.classList.toggle("hidden", count === 0);
+}
+
+function loadUntranslated(job) {
+  ensureCueIds();
+  const stats = job.stats || {};
+  state.untranslated = Array.isArray(stats.untranslated_ids) ? [...stats.untranslated_ids]
+    : (Array.isArray(stats.untranslated_indices) ? stats.untranslated_indices : [])
+      .map((index) => state.cues[index] && state.cues[index].id).filter(Boolean);
+  updateTransWarn();
+}
+
+function markUntranslated(cue) {
+  if (state.showTrans && cue.text.trim() && !(cue.trans || "").trim()) {
+    ensureCueIds();
+    if (!state.untranslated.includes(cue.id)) state.untranslated.push(cue.id);
+  }
 }
 
 function parseGlossary(text) {
@@ -331,7 +359,7 @@ async function loadSettings() {
     els.dubHint.textContent = `Video lồng tiếng xuất vào ${state.dubOutputDir}`;
     state.toolV1Url = data.tool_v1_url || "http://127.0.0.1:8088";
     els.toolV1Url.value = state.toolV1Url;
-    els.toolV1State.textContent = "Tool V1 sẽ lồng tiếng Việt và che phụ đề gốc khi render.";
+    checkToolV1Connection();
     const glossary = Array.isArray(data.glossary) ? data.glossary : [];
     els.glossaryInput.value = glossary
       .map((item) => `${item.src} = ${item.dst}`)
@@ -395,8 +423,7 @@ async function saveToolV1Url() {
     if (!res.ok) throw new Error(data.detail || "save failed");
     state.toolV1Url = data.tool_v1_url || url || "http://127.0.0.1:8088";
     els.toolV1Url.value = state.toolV1Url;
-    els.toolV1State.textContent = `Sẽ gửi sang ${state.toolV1Url}`;
-    els.toolV1State.className = "small muted";
+    checkToolV1Connection();
     showToast("Đã lưu địa chỉ Tool V1", "success");
   } catch (err) {
     els.toolV1State.textContent = `Không lưu được: ${String(err.message || err).slice(0, 120)}`;
@@ -404,6 +431,41 @@ async function saveToolV1Url() {
     showToast("Địa chỉ Tool V1 không hợp lệ", "error");
   } finally {
     els.saveToolV1Btn.disabled = false;
+  }
+}
+
+async function checkToolV1Connection() {
+  const sequence = ++state.toolV1CheckSeq;
+  els.checkToolV1Btn.disabled = true;
+  els.toolV1Connection.textContent = "Đang kiểm tra kết nối dashboard…";
+  els.toolV1Connection.className = "small muted";
+  try {
+    const res = await fetch("/api/tool-v1/status");
+    const data = await res.json();
+    if (sequence !== state.toolV1CheckSeq) return;
+    state.toolV1Connected = Boolean(res.ok && data.ok && data.authorized);
+    if (data.dashboard_url && /^https?:\/\//i.test(data.dashboard_url)) {
+      els.toolV1Dashboard.href = data.dashboard_url;
+    }
+    const message = state.toolV1Connected
+      ? "Đã kết nối Tool V1 · sẵn sàng nhận phụ đề và vùng blur"
+      : "Chưa kết nối được Tool V1: " + (data.detail || "kiểm tra dashboard và khóa kết nối");
+    els.toolV1Connection.textContent = message;
+    els.toolV1Connection.className = state.toolV1Connected ? "small ok" : "small bad";
+    els.toolV1State.textContent = message;
+    els.toolV1State.className = els.toolV1Connection.className;
+  } catch (err) {
+    if (sequence !== state.toolV1CheckSeq) return;
+    state.toolV1Connected = false;
+    els.toolV1Connection.textContent = "Không kiểm tra được kết nối Tool V1. Bấm kiểm tra để thử lại.";
+    els.toolV1Connection.className = "small bad";
+    els.toolV1State.textContent = els.toolV1Connection.textContent;
+    els.toolV1State.className = "small bad";
+  } finally {
+    if (sequence === state.toolV1CheckSeq) {
+      els.checkToolV1Btn.disabled = false;
+      renderHandoff(state.handoff);
+    }
   }
 }
 
@@ -428,23 +490,28 @@ function renderHandoff(record) {
     panel.classList.remove("ok", "bad");
     els.handoffNote.textContent = "";
     els.handoffOut.textContent = "";
-    els.handoffBtn.textContent = "Gửi sang Tool V1 · lồng tiếng + che sub";
-    els.handoffBtn.disabled = state.running || state.handoffSending;
+    els.handoffBtn.textContent = "Blur che sub + xuất video";
+    els.handoffBtn.disabled = state.running || state.handoffSending || state.toolV1Connected === false;
     return;
   }
 
   const status = String(record.status || "queued");
   const active = HANDOFF_ACTIVE.includes(status);
+  const confirming = status === "queued" && !record.remote_job_id;
+  const queued = status === "queued" && Boolean(record.remote_job_id) && record.queue_position > 0;
   const pct = Math.max(0, Math.min(100, Number(record.progress) || 0));
   panel.classList.remove("hidden");
   panel.classList.toggle("ok", status === "done");
   panel.classList.toggle("bad", status === "error" || status === "cancelled");
   els.handoffBar.style.width = status === "done" ? "100%" : `${pct}%`;
   els.handoffPct.textContent = status === "done" ? "100%" : `${pct}%`;
-  els.handoffStage.textContent = record.stage || "Đang chờ Tool V1 phản hồi…";
-  els.handoffCancelBtn.classList.toggle("hidden", !active || status === "cancelling");
+  els.handoffStage.textContent = record.stage || (confirming
+    ? "Đang xác nhận kết quả gửi sang Tool V1…" : "Đang chờ Tool V1 phản hồi…");
+  els.handoffCancelBtn.classList.toggle("hidden", !active || status === "cancelling" || !record.remote_job_id);
+  els.handoffCancelBtn.textContent = queued ? "Rút khỏi hàng chờ" : "Hủy render";
 
   const notes = [];
+  if (queued && record.queue_position > 0) notes.push("Vị trí chờ: " + record.queue_position);
   if (record.cue_count) notes.push(`${record.cue_count} câu`);
   if (record.translated_count != null) notes.push(`${record.translated_count} bản dịch`);
   const result = record.result || {};
@@ -461,9 +528,9 @@ function renderHandoff(record) {
   els.handoffOut.textContent = status === "done" ? String(result.delivered || result.final_video || "") : "";
 
   els.handoffBtn.textContent = active
-    ? "Đang render ở Tool V1…"
-    : status === "done" ? "Gửi lại sang Tool V1" : "Gửi sang Tool V1 · lồng tiếng + che sub";
-  els.handoffBtn.disabled = state.running || state.handoffSending || active;
+    ? confirming ? "Đang xác nhận gửi sang Tool V1…" : queued ? "Đang trong hàng chờ…" : "Đang render ở Tool V1…"
+    : status === "done" ? "Xuất lại video có blur" : "Blur che sub + xuất video";
+  els.handoffBtn.disabled = state.running || state.handoffSending || active || state.toolV1Connected === false;
 
   if (active) pollHandoff();
   else stopHandoffPolling();
@@ -497,7 +564,8 @@ function pollHandoff(delay = 2000) {
 }
 
 async function sendHandoff() {
-  if (!state.job || state.running || state.handoffSending) return;
+  if (!state.job || state.running || state.handoffSending || state.toolV1Connected === false
+      || (state.handoff && HANDOFF_ACTIVE.includes(String(state.handoff.status || "queued")))) return;
   const context = editorContext();
   const translated = state.cues.filter((cue) => (cue.trans || "").trim()).length;
   if (!translated && !window.confirm(
@@ -506,28 +574,61 @@ async function sendHandoff() {
   state.handoffSending = true;
   els.handoffBtn.disabled = true;
   els.handoffBtn.textContent = "Đang gửi…";
+  let sendAttempted = false;
+  let responseStatus = null;
   try {
-    if (!(await saveCues()) || !isCurrentEditor(context)) return;
+    if (!(await saveCues()) || !isCurrentEditor(context) || state.toolV1Connected === false) return;
+    sendAttempted = true;
     const res = await fetch("/api/jobs/" + context.jobId + "/handoff", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ target_lang: els.translateTo.value || null }),
+      body: JSON.stringify({ target_lang: els.translateTo.value || null, blur_radius: Number(els.handoffBlur.value || 16) }),
     });
     const data = await res.json().catch(() => ({}));
     if (!isCurrentEditor(context)) return;
+    responseStatus = res.status;
     if (!res.ok) throw new Error(data.detail || "Tool V1 không phản hồi (" + res.status + ")");
     renderHandoff(data.handoff);
-    showToast("Đã gửi sang Tool V1 — đang lồng tiếng và che phụ đề gốc", "success");
+    showToast(data.handoff?.queue_position > 0
+      ? "Đã đưa video vào hàng chờ Tool V1"
+      : "Đã gửi video sang Tool V1", "success");
   } catch (err) {
     if (!isCurrentEditor(context)) return;
     const message = String(err.message || err).slice(0, 200);
-    renderHandoff({ ...(state.handoff || {}), status: "error", stage: "Không gửi được sang Tool V1", error: message });
-    showToast(message, "error");
+    let reconciled = false;
+    let record = null;
+    if (sendAttempted) {
+      try {
+        // A failed POST can still have started a remote render or persisted an
+        // intent. Reconcile that record before enabling another send.
+        const res = await fetch("/api/jobs/" + context.jobId + "/handoff");
+        const data = await res.json();
+        if (!isCurrentEditor(context)) return;
+        if (!res.ok || !Object.prototype.hasOwnProperty.call(data, "handoff")) throw new Error("handoff status failed");
+        record = data.handoff;
+        reconciled = true;
+      } catch (statusError) {
+        if (!isCurrentEditor(context)) return;
+      }
+    }
+    const ambiguous = sendAttempted && (responseStatus === null || responseStatus >= 500 || responseStatus === 409);
+    const warning = "Chưa xác định kết quả gửi. Không gửi lại; kiểm tra Tool V1.";
+    if (reconciled && record) {
+      renderHandoff(record);
+      showToast(record.status === "queued" && !record.remote_job_id ? warning : message, "error");
+    } else if (!reconciled && ambiguous) {
+      renderHandoff({ status: "queued", remote_job_id: null, progress: 0, stage: warning, error: message });
+      showToast(warning, "error");
+    } else {
+      renderHandoff({ status: "error", stage: "Không gửi được sang Tool V1", error: message });
+      showToast(message, "error");
+    }
   } finally {
     if (isCurrentEditor(context)) {
       state.handoffSending = false;
-      els.handoffBtn.disabled = Boolean(state.handoff && HANDOFF_ACTIVE.includes(state.handoff.status));
-      if (!state.handoff) els.handoffBtn.textContent = "Gửi sang Tool V1 · lồng tiếng + che sub";
+      els.handoffBtn.disabled = state.running || state.toolV1Connected === false
+        || Boolean(state.handoff && HANDOFF_ACTIVE.includes(state.handoff.status));
+      if (!state.handoff) els.handoffBtn.textContent = "Blur che sub + xuất video";
     }
   }
 }
@@ -580,8 +681,19 @@ function uploadFile(file) {
 
 /* ---------------- job lifecycle ---------------- */
 
+function resetTranslationUI() {
+  state.retranslating = false;
+  els.retransAllBtn.disabled = false;
+  els.retransAllBtn.classList.remove("spin");
+  els.retransAllBtn.textContent = "Dịch lại chỗ thiếu";
+}
+
 function openJob(job, restored) {
   closeEvents();
+  stopPreviewPolling();
+  resetTranslationUI();
+  els.handoffCancelBtn.disabled = false;
+  els.previewBtn.disabled = false;
   clearTimeout(state.saveTimer);
   state.saveTimer = null;
   state.editorSession += 1;
@@ -594,7 +706,6 @@ function openJob(job, restored) {
   state.activeCue = -1;
   state.undoStack = [];
   updateUndoUI();
-  state.untranslated = (job.status === "done" && job.stats && job.stats.untranslated_indices) || [];
   state.showTrans = Boolean(
     (job.params && job.params.translate_to) || state.cues.some((cue) => cue.trans)
   );
@@ -603,6 +714,7 @@ function openJob(job, restored) {
   }
   updateTranslateUI();
   updateExportUI();
+  loadUntranslated(job);
   if (state.showTrans) els.exportVariant.value = "translated";
   try {
     localStorage.setItem("subx_job", job.id);
@@ -643,15 +755,18 @@ function openJob(job, restored) {
     els.progressPct.textContent = "100%";
     els.stageLabel.textContent = "Hoàn tất";
     els.progressMsg.textContent = job.message || "";
-    state.untranslated = (job.stats && job.stats.untranslated_indices) || [];
-    renderCues();
-    updateTransWarn();
-    if (job.stats) showStats(job.stats);
   } else if (job.status === "error") {
     els.stageLabel.textContent = "Lỗi";
     els.progressMsg.textContent = job.error || job.message || "";
+  } else if (job.status === "cancelled") {
+    els.stageLabel.textContent = "Đã hủy";
+    els.progressMsg.textContent = job.message || "Bạn có thể chạy lại với cài đặt khác.";
   } else {
     els.stageLabel.textContent = "Sẵn sàng";
+  }
+  if (job.status === "done" || (["error", "cancelled"].includes(job.status) && state.cues.length)) {
+    renderCues();
+    if (job.stats) showStats(job.stats);
   }
 
   requestAnimationFrame(() => {
@@ -677,9 +792,13 @@ async function startJob() {
   const context = editorContext();
   if (!(await saveCues()) || !isCurrentEditor(context)) return;
   state.editorSession += 1;
+  stopPreviewPolling();
+  els.previewBtn.disabled = false;
+  els.previewState.textContent = "";
+  els.handoffCancelBtn.disabled = false;
+  resetTranslationUI();
   state.resultPending = false;
   state.cueSave = null;
-  state.retranslating = false;
   state.handoffSending = false;
   // Keep the previous result until the server accepts the new run.
   els.resultCard.classList.add("hidden");
@@ -754,7 +873,7 @@ function setRunning(running) {
   els.checkGeminiBtn.disabled = running;
   els.dubEnabled.disabled = running;
   els.addCueBtn.disabled = running;
-  els.handoffBtn.disabled = running || state.handoffSending
+  els.handoffBtn.disabled = running || state.handoffSending || state.toolV1Connected === false
     || Boolean(state.handoff && HANDOFF_ACTIVE.includes(String(state.handoff.status)));
   els.roiLayer.classList.toggle("running", running);
   updateUndoUI();
@@ -876,35 +995,52 @@ function pollJob() {
 
 async function onJobFinished(snapshot) {
   const context = editorContext();
-  if (!isEditorSession(context) || (snapshot.id && snapshot.id !== context.jobId)) return;
-  if (snapshot.status === "done") {
-    state.resultPending = true;
-    try {
-      const res = await fetch(`/api/jobs/${state.job.id}`);
-      const job = await res.json();
-      if (!isEditorSession(context)) return;
-      if (!res.ok) throw new Error("result failed");
-      state.job = job;
-      state.cueSave = null;
-      state.cues = job.cues || [];
-      state.resultPending = false;
-      setRunning(false);
-      state.showTrans = Boolean(
-        (job.params && job.params.translate_to) || state.cues.some((cue) => cue.trans)
-      );
-      updateExportUI();
-      if (state.showTrans) els.exportVariant.value = "translated";
+  if (!isEditorSession(context) || (snapshot.id && snapshot.id !== context.jobId)
+      || !["done", "error", "cancelled"].includes(snapshot.status)) return;
+  // Failed/cancelled reruns can retain a previous result. Reconcile it before
+  // allowing any cue PUT, just as for a successful run.
+  state.resultPending = true;
+  try {
+    const res = await fetch(`/api/jobs/${context.jobId}`);
+    const job = await res.json();
+    if (!isEditorSession(context)) return;
+    if (!res.ok || job.id !== context.jobId) throw new Error("result failed");
+    state.job = job;
+    state.cueSave = null;
+    state.cues = job.cues || [];
+    state.resultPending = false;
+    state.showTrans = Boolean(
+      (job.params && job.params.translate_to) || state.cues.some((cue) => cue.trans)
+    );
+    if (job.params && job.params.translate_to) {
+      els.translateTo.value = job.params.translate_to;
+      updateTranslateUI();
+    }
+    updateExportUI();
+    loadUntranslated(job);
+    if (state.showTrans) els.exportVariant.value = "translated";
+    setRunning(false);
+    if (job.stats) showStats(job.stats);
+    updateDubUI(job);
+    renderHandoff((job.stats || {}).handoff);
+    renderCues();
+    const hasResult = snapshot.status === "done" || state.cues.length > 0;
+    els.resultCard.classList.toggle("hidden", !hasResult);
+    if (hasResult) els.resultCard.scrollIntoView({ behavior: "smooth", block: "start" });
+
+    if (snapshot.status === "cancelled") {
+      els.stageLabel.textContent = "Đã hủy";
+      els.progressMsg.textContent = "Bạn có thể chạy lại với cài đặt khác.";
+      showToast("Đã hủy xử lý");
+    } else if (snapshot.status === "error") {
+      els.stageLabel.textContent = "Lỗi";
+      els.progressMsg.textContent = snapshot.error || job.error || snapshot.message || "Xử lý thất bại";
+      showToast(snapshot.error || job.error || "Xử lý thất bại", "error");
+    } else {
       els.stageLabel.textContent = "Hoàn tất";
       els.progressBar.style.width = "100%";
       els.progressPct.textContent = "100%";
       els.progressMsg.textContent = job.message || `Đã tạo ${state.cues.length} cue.`;
-      if (job.stats) showStats(job.stats);
-      updateDubUI(job);
-      renderCues();
-      state.untranslated = (job.stats && job.stats.untranslated_indices) || [];
-      updateTransWarn();
-      els.resultCard.classList.remove("hidden");
-      els.resultCard.scrollIntoView({ behavior: "smooth", block: "start" });
       const translated = state.cues.filter((cue) => cue.trans).length;
       if (job.stats && job.stats.translate_error) {
         showToast(`Đã bóc phụ đề nhưng dịch lỗi: ${job.stats.translate_error}`, "error");
@@ -921,22 +1057,12 @@ async function onJobFinished(snapshot) {
           "success"
         );
       }
-    } catch (err) {
-      if (isEditorSession(context)) {
-        setRunning(false);
-        showToast("Không tải được kết quả. Tải lại trang để thử lại.", "error");
-      }
     }
-  } else if (snapshot.status === "cancelled") {
-    setRunning(false);
-    els.stageLabel.textContent = "Đã hủy";
-    els.progressMsg.textContent = "Bạn có thể chạy lại với cài đặt khác.";
-    showToast("Đã hủy xử lý");
-  } else if (snapshot.status === "error") {
-    setRunning(false);
-    els.stageLabel.textContent = "Lỗi";
-    els.progressMsg.textContent = snapshot.error || snapshot.message || "Xử lý thất bại";
-    showToast(snapshot.error || "Xử lý thất bại", "error");
+  } catch (err) {
+    if (isEditorSession(context)) {
+      setRunning(false);
+      showToast("Không tải được kết quả. Tải lại trang để thử lại.", "error");
+    }
   }
 }
 
@@ -954,7 +1080,12 @@ function resetWorkspace() {
   state.cueSave = null;
   state.handoffSending = false;
   clearTimeout(state.saveTimer);
-  if (state.previewTimer) clearTimeout(state.previewTimer);
+  state.saveTimer = null;
+  stopPreviewPolling();
+  resetTranslationUI();
+  els.previewBtn.disabled = false;
+  els.previewState.textContent = "";
+  els.handoffCancelBtn.disabled = false;
   state.job = null;
   state.cues = [];
   state.running = false;
@@ -1080,6 +1211,7 @@ function roiPoint(event) {
 /* ---------------- cues ---------------- */
 
 function renderCues() {
+  updateTransWarn();
   els.cueList.innerHTML = "";
   els.cueCount.textContent = `${state.cues.length} cue`;
   els.resultCard.classList.toggle("hidden", state.cues.length === 0 && !state.job);
@@ -1233,8 +1365,11 @@ function replaceAllInCues() {
   };
   snapshotCues("tìm & thay");
   state.cues.forEach((cue) => {
+    const previousText = cue.text;
+    const previousTrans = cue.trans;
     cue.text = replaceIn(cue.text);
     if (cue.trans) cue.trans = replaceIn(cue.trans);
+    if (cue.text !== previousText || cue.trans !== previousTrans) markUntranslated(cue);
   });
   renderCues();
   markDirty();
@@ -1277,6 +1412,7 @@ function saveStateFor(jobId) {
 
 function markDirty() {
   if (!state.job) return;
+  updateTransWarn();
   const context = editorContext();
   saveStateFor(context.jobId).revision += 1;
   els.saveState.textContent = "Chưa lưu…";
@@ -1379,10 +1515,12 @@ function handleCueInput(event) {
     markDirty();
   } else if (target.classList.contains("cue-trans")) {
     cue.trans = target.value;
+    markUntranslated(cue);
     autoGrow(target);
     markDirty();
   } else if (target.classList.contains("cue-text")) {
     cue.text = target.value;
+    markUntranslated(cue);
     autoGrow(target);
     markDirty();
   }
@@ -1447,20 +1585,6 @@ function undoEdit() {
   updateUndoUI();
   markDirty();
   showToast(`Đã hoàn tác ${entry.label}`);
-}
-
-function captureUntranslated() {
-  return new Set(state.untranslated.map((i) => state.cues[i]).filter(Boolean));
-}
-
-function restoreUntranslated(keep, extra = []) {
-  if (!state.showTrans) return;
-  const indices = new Set(state.cues.map((cue, index) => (keep.has(cue) ? index : -1)).filter((index) => index >= 0));
-  for (const index of extra) {
-    if (index >= 0 && index < state.cues.length) indices.add(index);
-  }
-  state.untranslated = [...indices].sort((a, b) => a - b);
-  updateTransWarn();
 }
 
 function cueDuration() {
@@ -1532,8 +1656,6 @@ function splitCue(event) {
     showToast("Dòng quá ngắn để tách — hãy sửa thời gian trước", "error");
     return;
   }
-  const keep = captureUntranslated();
-  const wasUntranslated = keep.has(cue);
   snapshotCues("tách dòng");
   const ratio = left.length / (left.length + right.length);
   const mid = round3(Math.min(cue.end - 0.2, Math.max(cue.start + 0.2, cue.start + (cue.end - cue.start) * ratio)));
@@ -1541,8 +1663,9 @@ function splitCue(event) {
   state.cues.splice(index, 1,
     { ...cue, end: mid, text: left, trans: transLeft },
     { start: mid, end: cue.end, text: right, trans: transRight, region: cue.region });
+  markUntranslated(state.cues[index]);
+  markUntranslated(state.cues[index + 1]);
   renderCues();
-  restoreUntranslated(keep, wasUntranslated ? [index, index + 1] : []);
   markDirty();
   const rightTa = $(`.cue[data-index="${index + 1}"] .cue-trans`, els.cueList)
     || $(`.cue[data-index="${index + 1}"] .cue-text`, els.cueList);
@@ -1560,8 +1683,6 @@ function mergeCue(event) {
   const cue = state.cues[index];
   const next = state.cues[index + 1];
   if (!cue || !next) return;
-  const keep = captureUntranslated();
-  const wasUntranslated = keep.has(cue) && keep.has(next);
   snapshotCues("gộp dòng");
   const join = (a, b) => [String(a || "").trim(), String(b || "").trim()].filter(Boolean).join(" ");
   state.cues.splice(index, 2, {
@@ -1570,8 +1691,8 @@ function mergeCue(event) {
     text: join(cue.text, next.text),
     trans: join(cue.trans, next.trans),
   });
+  markUntranslated(state.cues[index]);
   renderCues();
-  restoreUntranslated(keep, wasUntranslated ? [index] : []);
   markDirty();
 }
 
@@ -1581,11 +1702,9 @@ function deleteCue(event) {
   const row = button.closest(".cue");
   const index = Number(row.dataset.index);
   if (state.running) return;
-  const keep = captureUntranslated();
   snapshotCues("xóa dòng");
   state.cues.splice(index, 1);
   renderCues();
-  restoreUntranslated(keep);
   markDirty();
 }
 
@@ -1593,11 +1712,16 @@ function cueFingerprint(cue) {
   return JSON.stringify([cue.id, cue.start, cue.end, cue.text, cue.trans || "", cue.region]);
 }
 
-async function retranslateCueCore(cueOrIndex, context = editorContext()) {
+async function retranslateCueCore(cueOrIndex, context = editorContext(), missingOnly = false) {
   const cue = typeof cueOrIndex === "number" ? state.cues[cueOrIndex] : cueOrIndex;
-  if (!cue || !isCurrentEditor(context)) throw new Error("Video hoặc cue đã thay đổi");
+  if (!cue || !isCurrentEditor(context) || !state.cues.includes(cue)) throw new Error("Video hoặc cue đã thay đổi");
+  if (!cue.text.trim()) throw new Error("Cue trống; chưa gửi dịch lại");
+  if (missingOnly && (cue.trans || "").trim()) return false;
   if (!(await saveCues())) throw new Error("Không lưu được chỉnh sửa; chưa gửi dịch lại");
   if (!isCurrentEditor(context) || !state.cues.includes(cue)) throw new Error("Video hoặc cue đã thay đổi");
+  // A blank draft is omitted by PUT, so its ID is unknown to the server.
+  if (!cue.id || !cue.text.trim()) throw new Error("Cue trống; chưa gửi dịch lại");
+  if (missingOnly && (cue.trans || "").trim()) return false;
   const fingerprint = cueFingerprint(cue);
   const target = els.translateTo.value || (state.job.params || {}).translate_to || null;
   const res = await fetch("/api/jobs/" + context.jobId + "/retranslate", {
@@ -1619,10 +1743,10 @@ async function retranslateCueCore(cueOrIndex, context = editorContext()) {
     ta.value = cue.trans;
     autoGrow(ta);
   }
-  state.untranslated = state.untranslated.filter((i) => i !== index);
   updateTransWarn();
   markDirty();
   if (!(await saveCues())) throw new Error("Đã dịch nhưng chưa lưu được; bản dịch còn trong editor");
+  return true;
 }
 
 async function retranslateCue(index, btn) {
@@ -1637,9 +1761,11 @@ async function retranslateCue(index, btn) {
   } catch (err) {
     if (isCurrentEditor(context)) showToast(err.message || "Dịch lại thất bại", "error");
   } finally {
-    if (isCurrentEditor(context)) state.retranslating = false;
-    btn.disabled = false;
-    btn.classList.remove("spin");
+    if (isEditorSession(context)) {
+      state.retranslating = false;
+      btn.disabled = false;
+      btn.classList.remove("spin");
+    }
   }
 }
 
@@ -1652,13 +1778,15 @@ async function retranslateMissing() {
   let failed = 0;
   try {
     if (!(await saveCues()) || !isCurrentEditor(context)) return;
-    const list = state.untranslated.map((index) => state.cues[index]).filter(Boolean);
+    updateTransWarn();
+    const list = [...state.untranslated];
     for (let i = 0; i < list.length; i += 1) {
       if (!isCurrentEditor(context)) return;
       els.retransAllBtn.textContent = "Đang dịch lại " + (i + 1) + "/" + list.length + "…";
+      const cue = state.cues.find((item) => item.id === list[i]);
+      if (!cue || !cue.text.trim() || (cue.trans || "").trim()) continue;
       try {
-        await retranslateCueCore(list[i], context);
-        okCount += 1;
+        if (await retranslateCueCore(cue, context, true)) okCount += 1;
       } catch (err) {
         if (!isCurrentEditor(context)) return;
         failed += 1;
@@ -1669,11 +1797,7 @@ async function retranslateMissing() {
       showToast("Dịch lại xong: " + okCount + " cue" + (failed ? " · lỗi " + failed : ""), failed ? "error" : "success");
     }
   } finally {
-    if (isCurrentEditor(context)) {
-      state.retranslating = false;
-      els.retransAllBtn.disabled = false;
-      els.retransAllBtn.textContent = "Dịch lại chỗ thiếu";
-    }
+    if (isEditorSession(context)) resetTranslationUI();
   }
 }
 
@@ -1697,6 +1821,8 @@ function handleCueBlur(event) {
     return;
   }
   cue.text = event.target.value;
+  markUntranslated(cue);
+  updateTransWarn();
 }
 
 function updateActiveCue() {
@@ -1736,29 +1862,42 @@ async function exportCues(format) {
 
 /* ---------------- video fallback ---------------- */
 
+function stopPreviewPolling() {
+  clearTimeout(state.previewTimer);
+  state.previewTimer = null;
+}
+
 async function requestPreview() {
-  if (!state.job) return;
+  if (!state.job || els.previewBtn.disabled) return;
+  const context = editorContext();
+  stopPreviewPolling();
   els.previewBtn.disabled = true;
   els.previewState.textContent = "Đang tạo bản xem trước…";
   try {
-    await fetch(`/api/jobs/${state.job.id}/preview`, { method: "POST" });
-    pollPreview();
+    const res = await fetch(`/api/jobs/${context.jobId}/preview`, { method: "POST" });
+    if (!isEditorSession(context)) return;
+    if (!res.ok) throw new Error("preview request failed");
+    void pollPreview(context);
   } catch (err) {
+    if (!isEditorSession(context)) return;
     els.previewBtn.disabled = false;
     els.previewState.textContent = "Không gửi được yêu cầu.";
   }
 }
 
-async function pollPreview() {
-  if (!state.job) return;
+async function pollPreview(context = editorContext()) {
+  if (!isEditorSession(context)) return;
+  stopPreviewPolling();
   try {
-    const res = await fetch(`/api/jobs/${state.job.id}`);
+    const res = await fetch(`/api/jobs/${context.jobId}`);
     const job = await res.json();
+    if (!isEditorSession(context)) return;
+    if (!res.ok || job.id !== context.jobId) throw new Error("preview status failed");
     if (job.preview_status === "ready") {
       els.videoError.classList.add("hidden");
       els.previewBtn.disabled = false;
       els.previewState.textContent = "";
-      els.video.src = `/api/jobs/${job.id}/video?preview=1&v=${Date.now()}`;
+      els.video.src = `/api/jobs/${context.jobId}/video?preview=1&v=${Date.now()}`;
       els.video.load();
       showToast("Đã tạo bản xem trước", "success");
       return;
@@ -1769,8 +1908,15 @@ async function pollPreview() {
       return;
     }
     els.previewState.textContent = "Đang chuyển mã, vui lòng chờ…";
-  } catch (err) {}
-  state.previewTimer = setTimeout(pollPreview, 1500);
+  } catch (err) {
+    if (!isEditorSession(context)) return;
+  }
+  if (!isEditorSession(context)) return;
+  state.previewTimer = setTimeout(() => {
+    if (!isEditorSession(context)) return;
+    state.previewTimer = null;
+    void pollPreview(context);
+  }, 1500);
 }
 
 /* ---------------- events ---------------- */
@@ -1997,24 +2143,34 @@ function bindEvents() {
   els.exportVtt.addEventListener("click", () => exportCues("vtt"));
 
   els.saveToolV1Btn.addEventListener("click", saveToolV1Url);
+  els.checkToolV1Btn.addEventListener("click", checkToolV1Connection);
   els.toolV1Url.addEventListener("keydown", (event) => {
     if (event.key === "Enter") saveToolV1Url();
   });
   els.handoffBtn.addEventListener("click", sendHandoff);
-  els.handoffCloseBtn.addEventListener("click", () => renderHandoff(null));
+  els.handoffCloseBtn.addEventListener("click", () => {
+    if (state.handoff && HANDOFF_ACTIVE.includes(String(state.handoff.status || "queued"))) {
+      els.handoffPanel.classList.add("hidden");
+      return;
+    }
+    renderHandoff(null);
+  });
   els.handoffCancelBtn.addEventListener("click", async () => {
-    if (!state.job || !state.handoff || String(state.handoff.status) === "cancelling") return;
+    if (!state.job || !state.handoff || !state.handoff.remote_job_id || els.handoffCancelBtn.disabled
+        || String(state.handoff.status) === "cancelling") return;
+    const context = editorContext();
     els.handoffCancelBtn.disabled = true;
     try {
-      const res = await fetch(`/api/jobs/${state.job.id}/handoff/cancel`, { method: "POST" });
+      const res = await fetch(`/api/jobs/${context.jobId}/handoff/cancel`, { method: "POST" });
       const data = await res.json().catch(() => ({}));
+      if (!isEditorSession(context)) return;
       if (!res.ok) throw new Error(data.detail || "Không hủy được render");
       renderHandoff(data.handoff);
       showToast("Đã yêu cầu Tool V1 dừng render", "success");
     } catch (err) {
-      showToast(String(err.message || err).slice(0, 200), "error");
+      if (isEditorSession(context)) showToast(String(err.message || err).slice(0, 200), "error");
     } finally {
-      els.handoffCancelBtn.disabled = false;
+      if (isEditorSession(context)) els.handoffCancelBtn.disabled = false;
     }
   });
 }

@@ -5,7 +5,7 @@ import threading
 import cv2
 import numpy as np
 
-from .post import han_ratio
+from .post import clean_ocr_lines, han_ratio
 
 Box = tuple[int, int, int, int]
 
@@ -70,6 +70,27 @@ class OcrEngine:
         if not results:
             return "", 0.0
         items = sorted(results, key=lambda r: (min(p[1] for p in r[0]), min(p[0] for p in r[0])))
+        if set(self.langs) == {"zh"}:
+            # Keep physical rows separate: a numeric label on another row must
+            # not become valid just because readtext also returned Chinese.
+            rows = []
+            for box, text, conf in items:
+                top, bottom = min(p[1] for p in box), max(p[1] for p in box)
+                row = next((row for row in rows
+                            if min(row["bottom"], bottom) - max(row["top"], top)
+                            >= .5 * min(row["bottom"] - row["top"], bottom - top)), None)
+                if row is None:
+                    row = {"top": top, "bottom": bottom, "parts": []}
+                    rows.append(row)
+                row["parts"].append((min(p[0] for p in box), str(text).strip(), float(conf)))
+            texts, confs = [], []
+            for row in rows:
+                parts = sorted(row["parts"])
+                kept = clean_ocr_lines(" ".join(part[1] for part in parts), chinese_only=True)
+                if kept:
+                    texts.extend(kept)
+                    confs.extend(part[2] for part in parts if part[1])
+            return ("\n".join(texts), float(np.mean(confs))) if texts else ("", 0.0)
         texts = [str(r[1]).strip() for r in items if str(r[1]).strip()]
         confs = [float(r[2]) for r in items if str(r[1]).strip()]
         if not texts:
@@ -92,7 +113,7 @@ class OcrEngine:
                     fallback, fallback_conf = self._read_fallback(reader, variant)
                     if fallback_conf > conf:
                         text, conf = fallback, fallback_conf
-                text = text.strip()
+                text = "\n".join(clean_ocr_lines(text, chinese_only=set(self.langs) == {"zh"}))
                 if not text:
                     continue
                 # Reader zh (ch_sim+en) đọc chữ Latin không dấu khá tự tin, dễ thắng
@@ -157,8 +178,9 @@ class OcrEngine:
             if len(segments) >= 2:
                 seg_text, seg_conf = self._read_segments(rgb_crop, segments)
                 # Đọc tách dòng khắc phục hộp nhiều dòng bị dính chữ/mất dòng;
-                # chỉ dùng khi tin cậy hơn đọc cả khối.
-                if seg_text.strip() and seg_conf > whole[1]:
+                # Nguồn zh ưu tiên đọc từng dòng để không ghép số ở hàng riêng;
+                # nguồn hỗn hợp vẫn cần confidence cao hơn đọc cả khối.
+                if seg_text.strip() and (set(self.langs) == {"zh"} or seg_conf > whole[1]):
                     return seg_text, seg_conf, "multi"
         return whole
 

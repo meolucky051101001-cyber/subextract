@@ -180,6 +180,7 @@ function harness() {
   const storage = new Map();
   const sandbox = {
     document, console,
+    EventSource: class { close() {} },
     setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout,
     requestAnimationFrame: clock.setTimeout,
     localStorage: {
@@ -217,7 +218,8 @@ function harness() {
   vm.runInContext(source.replace(/\binit\(\);\s*$/, ''), sandbox, { filename: APP });
   const api = vm.runInContext(
     '({ state, els, openJob, resetWorkspace, saveCues, markDirty, handleCueInput, '
-      + 'exportCues, sendHandoff, retranslateCue, retranslateMissing, onJobFinished, pollJob, pollHandoff, startJob, bindEvents })', sandbox);
+      + 'exportCues, sendHandoff, renderHandoff, retranslateCue, retranslateMissing, onJobFinished, pollJob, pollHandoff, startJob, bindEvents, '
+      + 'addCue, deleteCue, handleCueBlur, undoEdit, splitCue, mergeCue, replaceAllInCues, requestPreview, pollPreview, checkToolV1Connection })', sandbox);
   api.openJob(job(), false);
   function edit(field, value, index = 0) {
     const row = api.els.cueList.querySelector('.cue[data-index="' + index + '"]');
@@ -415,7 +417,8 @@ for (const [field, value] of [['text', 'new source'], ['trans', 'manual translat
     assert.equal(h.requests.length, 2, 'stale preview does not cause a PUT');
     await pending;
     assert.equal(h.api.state.cues[0].trans, field === 'trans' ? value : '');
-    assert.equal(h.api.state.untranslated.length, 1);
+    assert.equal(h.api.state.untranslated.length, field === 'trans' ? 0 : 1,
+      'a manual translation resolves the missing warning even if a preview is discarded');
     assert.doesNotMatch(h.api.els.toast.textContent, /^Đã dịch lại cue$/);
   });
 }
@@ -677,4 +680,715 @@ test('late handoff poll response cannot alter job B or start another poll', asyn
   assert.equal(h.api.state.handoffFails, 0);
   await h.clock.advance(6000);
   assert.equal(h.requests.length, 1, 'old handoff response cannot schedule polling for B');
+});
+
+function mixedJob() {
+  const result = job('job-a', [
+    { id: 'cue-a', start: 1, end: 2, text: 'source A', trans: 'TRANSLATED A' },
+    { id: 'cue-b', start: 3, end: 4, text: 'source B', trans: '' },
+    { id: 'cue-c', start: 5, end: 6, text: 'source C', trans: 'MANUAL C' },
+  ]);
+  result.stats.untranslated_indices = [1];
+  return result;
+}
+
+function cueField(h, index, selector = '.cue-text') {
+  const row = h.api.els.cueList.querySelector('.cue[data-index="' + index + '"]');
+  assert.ok(row, 'cue row exists');
+  const target = row.querySelector(selector);
+  assert.ok(target, 'cue field exists');
+  return target;
+}
+
+for (const mutation of ['insert blank before B', 'delete A', 'blank A then blur']) {
+  test('missing translation follows B after ' + mutation + ' and preserves manual C', async () => {
+    const h = harness();
+    h.api.openJob(mixedJob(), false);
+    if (mutation === 'insert blank before B') {
+      h.api.state.activeCue = 0;
+      h.api.addCue();
+    } else if (mutation === 'delete A') {
+      h.api.deleteCue({ target: cueField(h, 0, '.del-btn') });
+    } else {
+      h.edit('text', '   ', 0);
+      h.api.handleCueBlur({ target: cueField(h, 0) });
+    }
+    assert.deepEqual([...h.api.state.untranslated], ['cue-b']);
+    const pending = h.api.retranslateMissing();
+    const initial = assertRequest(h, 0, 'PUT', 'cues');
+    assert.equal(initial.body.cues.some((cue) => !cue.text.trim()), false, 'blank draft is never persisted');
+    initial.respond();
+    await tick();
+    const post = assertRequest(h, 1, 'POST', 'retranslate');
+    assert.equal(post.body.cue_id, 'cue-b');
+    assert.equal(post.body.text, 'source B');
+    post.respond(200, { ok: true, cue_id: 'cue-b', trans: 'TRANSLATED B' });
+    await tick();
+    const put = assertRequest(h, 2, 'PUT', 'cues');
+    assert.equal(put.body.cues.find((cue) => cue.id === 'cue-c').trans, 'MANUAL C');
+    put.respond();
+    await pending;
+    assert.equal(h.api.state.cues.find((cue) => cue.id === 'cue-b').trans, 'TRANSLATED B');
+    assert.equal(h.api.state.cues.find((cue) => cue.id === 'cue-c').trans, 'MANUAL C');
+    assert.equal(h.api.els.transWarn.classList.contains('hidden'), true);
+    assert.equal(h.requests.length, 3, 'only B is translated');
+  });
+}
+
+test('failed missing translation retains the B warning after rows shift', async () => {
+  const h = harness();
+  h.api.openJob(mixedJob(), false);
+  h.edit('text', '', 0);
+  h.api.handleCueBlur({ target: cueField(h, 0) });
+  const pending = h.api.retranslateMissing();
+  assertRequest(h, 0, 'PUT', 'cues').respond();
+  await tick();
+  const post = assertRequest(h, 1, 'POST', 'retranslate');
+  assert.equal(post.body.cue_id, 'cue-b');
+  post.respond(503, { detail: 'translation unavailable' });
+  await pending;
+  assert.deepEqual([...h.api.state.untranslated], ['cue-b']);
+  assert.equal(h.api.els.transWarn.textContent, '1 cue chưa dịch');
+  assert.equal(h.api.state.cues[1].trans, 'MANUAL C');
+  assert.equal(h.requests.length, 2);
+});
+
+test('blank newly inserted cues never produce unknown-ID translation requests', async () => {
+  const h = harness();
+  const result = mixedJob();
+  result.cues[1].trans = 'MANUAL B';
+  result.stats.untranslated_indices = [];
+  h.api.openJob(result, false);
+  h.api.state.activeCue = 0;
+  h.api.addCue();
+  const draft = h.api.state.cues[1];
+  const pending = h.api.retranslateMissing();
+  const put = assertRequest(h, 0, 'PUT', 'cues');
+  assert.equal(put.body.cues.some((cue) => cue.id === draft.id), false);
+  put.respond();
+  await pending;
+  assert.equal(h.requests.length, 1, 'no POST follows a PUT that omitted the blank draft');
+  assert.equal(h.api.state.untranslated.length, 0);
+  await h.api.retranslateCue(1, cueField(h, 1, '.retrans-btn'));
+  assert.equal(h.requests.length, 1, 'single-cue translation also rejects blank drafts');
+});
+
+test('new cue is included only after source input and a successful PUT', async () => {
+  const h = harness();
+  const result = job('job-a', [{ id: 'cue-a', start: 1, end: 2, text: 'source', trans: 'manual' }]);
+  result.stats.untranslated_indices = [];
+  h.api.openJob(result, false);
+  h.api.addCue();
+  h.edit('text', 'new source', 1);
+  const id = h.api.state.cues[1].id;
+  assert.deepEqual([...h.api.state.untranslated], [id]);
+  const pending = h.api.retranslateMissing();
+  const put = assertRequest(h, 0, 'PUT', 'cues');
+  assert.equal(put.body.cues.find((cue) => cue.id === id).text, 'new source');
+  put.respond();
+  await tick();
+  const post = assertRequest(h, 1, 'POST', 'retranslate');
+  assert.equal(post.body.cue_id, id);
+  post.respond(200, { ok: true, cue_id: id, trans: 'new translation' });
+  await tick();
+  assertRequest(h, 2, 'PUT', 'cues').respond();
+  await pending;
+  assert.equal(h.api.state.cues[0].trans, 'manual');
+  assert.equal(h.api.state.cues[1].trans, 'new translation');
+});
+
+for (const change of ['manual translation', 'delete cue', 'blank source']) {
+  test('bulk skips a later target changed to ' + change + ' while an earlier preview waits', async () => {
+    const h = harness();
+    const result = mixedJob();
+    result.cues[0].trans = '';
+    result.stats.untranslated_indices = [0, 1];
+    h.api.openJob(result, false);
+    const pending = h.api.retranslateMissing();
+    assertRequest(h, 0, 'PUT', 'cues').respond();
+    await tick();
+    const first = assertRequest(h, 1, 'POST', 'retranslate');
+    assert.equal(first.body.cue_id, 'cue-a');
+    if (change === 'manual translation') h.edit('trans', 'MANUAL B', 1);
+    else if (change === 'delete cue') h.api.deleteCue({ target: cueField(h, 1, '.del-btn') });
+    else h.edit('text', ' ', 1);
+    first.respond(200, { ok: true, cue_id: 'cue-a', trans: 'TRANSLATED A' });
+    await tick();
+    const put = assertRequest(h, 2, 'PUT', 'cues');
+    if (change === 'manual translation') assert.equal(put.body.cues.find((cue) => cue.id === 'cue-b').trans, 'MANUAL B');
+    else assert.equal(put.body.cues.some((cue) => cue.id === 'cue-b'), false);
+    put.respond();
+    await pending;
+    assert.equal(h.requests.length, 3, 'removed or resolved target cannot cause a second POST');
+    assert.equal(h.api.state.cues.find((cue) => cue.id === 'cue-c').trans, 'MANUAL C');
+  });
+}
+
+test('missing warnings reflect manual edits, clearing translations, deletion and undo', () => {
+  const h = harness();
+  h.api.openJob(mixedJob(), false);
+  h.edit('trans', 'MANUAL B', 1);
+  assert.equal(h.api.els.transWarn.classList.contains('hidden'), true);
+  h.edit('trans', '   ', 1);
+  assert.deepEqual([...h.api.state.untranslated], ['cue-b']);
+  h.api.deleteCue({ target: cueField(h, 1, '.del-btn') });
+  assert.equal(h.api.state.untranslated.length, 0);
+  h.api.undoEdit();
+  assert.deepEqual([...h.api.state.untranslated], ['cue-b']);
+  assert.equal(h.api.els.transWarn.textContent, '1 cue chưa dịch');
+});
+
+test('split and merge preserve missing identity without turning manual translations into targets', () => {
+  const h = harness();
+  h.api.openJob(mixedJob(), false);
+  cueField(h, 1).selectionStart = 6;
+  h.api.splitCue({ target: cueField(h, 1, '.split-btn') });
+  assert.equal(h.api.state.untranslated.length, 2);
+  assert.equal(new Set(h.api.state.untranslated).size, 2);
+  assert.ok(h.api.state.untranslated.every((id) => h.api.state.cues.some((cue) => cue.id === id)));
+  h.api.mergeCue({ target: cueField(h, 1, '.merge-btn') });
+  assert.deepEqual([...h.api.state.untranslated], ['cue-b']);
+  assert.equal(h.api.state.cues[2].trans, 'MANUAL C');
+});
+
+test('reload prefers stable missing IDs over stale row indices and still translates only B', async () => {
+  const h = harness();
+  const reloaded = mixedJob();
+  reloaded.cues.shift();
+  reloaded.stats.untranslated_indices = [1];
+  reloaded.stats.untranslated_ids = ['cue-b', 'deleted-id', 'cue-c'];
+  h.api.openJob(reloaded, true);
+  assert.deepEqual([...h.api.state.untranslated], ['cue-b'], 'deleted IDs and manual translations are pruned');
+  const pending = h.api.retranslateMissing();
+  assertRequest(h, 0, 'PUT', 'cues').respond();
+  await tick();
+  const post = assertRequest(h, 1, 'POST', 'retranslate');
+  assert.equal(post.body.cue_id, 'cue-b');
+  post.respond(200, { ok: true, cue_id: 'cue-b', trans: 'TRANSLATED B' });
+  await tick();
+  const put = assertRequest(h, 2, 'PUT', 'cues');
+  assert.equal(put.body.cues.find((cue) => cue.id === 'cue-c').trans, 'MANUAL C');
+  put.respond();
+  await pending;
+  assert.equal(h.requests.length, 3);
+  assert.equal(h.api.state.untranslated.length, 0);
+});
+
+test('explicit empty stable missing IDs preserve exemptions instead of falling back to stale indices', async () => {
+  const h = harness();
+  const result = job();
+  result.stats.untranslated_ids = [];
+  h.api.openJob(result, true);
+  assert.equal(h.api.state.untranslated.length, 0);
+  assert.equal(h.api.els.transWarn.classList.contains('hidden'), true);
+  const pending = h.api.retranslateMissing();
+  assertRequest(h, 0, 'PUT', 'cues').respond();
+  await pending;
+  assert.equal(h.requests.length, 1, 'explicit stable metadata cannot trigger unintended translation');
+});
+
+
+test('find and replace updates missing identities only for changed blank translations', () => {
+  const h = harness();
+  const result = mixedJob();
+  result.stats.untranslated_indices = [];
+  h.api.openJob(result, false);
+  h.api.els.findInput.value = 'source B';
+  h.api.els.replaceInput.value = 'edited source B';
+  h.api.replaceAllInCues();
+  assert.deepEqual([...h.api.state.untranslated], ['cue-b']);
+  assert.equal(h.api.state.cues[2].trans, 'MANUAL C');
+  h.api.els.findInput.value = 'MANUAL C';
+  h.api.els.replaceInput.value = '';
+  h.api.replaceAllInCues();
+  assert.deepEqual([...h.api.state.untranslated], ['cue-b', 'cue-c']);
+});
+
+
+test('same-target backend exemptions remain warning-free until a source is edited', async () => {
+  const h = harness();
+  const result = job();
+  result.stats = { translate_total: 0, untranslated_indices: [] };
+  h.api.openJob(result, false);
+  assert.equal(h.api.state.untranslated.length, 0);
+  assert.equal(h.api.els.transWarn.classList.contains('hidden'), true);
+  const pending = h.api.retranslateMissing();
+  assertRequest(h, 0, 'PUT', 'cues').respond();
+  await pending;
+  assert.equal(h.requests.length, 1, 'bulk does not translate language-exempt sources');
+  h.edit('text', 'new source');
+  assert.deepEqual([...h.api.state.untranslated], ['cue-a']);
+});
+
+for (const outcome of ['ok', 'http', 'network']) {
+  for (const nextId of ['job-b', 'job-a']) {
+    test('late preview POST (' + outcome + ') cannot poll or alter a new ' + nextId + ' session', async () => {
+      const h = harness();
+      const pending = h.api.requestPreview();
+      const post = assertRequest(h, 0, 'POST', 'preview');
+      h.api.openJob(job(nextId), false);
+      const src = h.api.els.video.src;
+      const toast = h.api.els.toast.textContent;
+      assert.equal(h.api.els.previewBtn.disabled, false, 'new session resets the busy button');
+      const current = h.api.requestPreview();
+      const currentPost = h.requests[1];
+      assert.equal(currentPost.url, '/api/jobs/' + nextId + '/preview');
+      const label = h.api.els.previewState.textContent;
+      if (outcome === 'network') post.reject();
+      else post.respond(outcome === 'ok' ? 200 : 503);
+      await pending;
+      assert.equal(h.requests.length, 2, 'stale POST must not start a status GET for either session');
+      assert.equal(h.api.els.video.src, src);
+      assert.equal(h.api.els.previewBtn.disabled, true, 'old failure cannot release the current button');
+      assert.equal(h.api.els.previewState.textContent, label);
+      assert.equal(h.api.els.toast.textContent, toast);
+      assert.equal(h.api.state.previewTimer, null);
+      currentPost.respond(503);
+      await current;
+      await h.clock.advance(3000);
+      assert.equal(h.requests.length, 2);
+    });
+  }
+}
+
+for (const outcome of ['ready', 'error', 'running', 'network']) {
+  test('late preview GET (' + outcome + ') cannot change B footage, button or timer', async () => {
+    const h = harness();
+    const old = h.api.pollPreview();
+    const getA = h.requests[0];
+    assert.equal(getA.url, '/api/jobs/job-a');
+    h.api.openJob(job('job-b'), false);
+    const current = h.api.requestPreview();
+    h.requests[1].respond();
+    await current;
+    await tick();
+    const getB = h.requests[2];
+    assert.equal(getB.url, '/api/jobs/job-b');
+    getB.respond(200, { id: 'job-b', preview_status: 'running' });
+    await tick();
+    const timer = h.api.state.previewTimer;
+    assert.ok(timer);
+    const src = h.api.els.video.src;
+    const label = h.api.els.previewState.textContent;
+    const toast = h.api.els.toast.textContent;
+    if (outcome === 'network') getA.reject();
+    else getA.respond(200, { id: 'job-a', preview_status: outcome });
+    await old;
+    assert.equal(h.api.els.video.src, src);
+    assert.equal(h.api.els.previewBtn.disabled, true);
+    assert.equal(h.api.els.previewState.textContent, label);
+    assert.equal(h.api.els.toast.textContent, toast);
+    assert.equal(h.api.state.previewTimer, timer, 'old response cannot cancel or replace B timer');
+    await h.clock.advance(1500);
+    assert.equal(h.requests.length, 4);
+    assert.equal(h.requests[3].url, '/api/jobs/job-b');
+    h.requests[3].respond(200, { id: 'job-b', preview_status: 'ready' });
+    await tick();
+    assert.match(h.api.els.video.src, /^\/api\/jobs\/job-b\/video\?preview=1&/);
+  });
+}
+
+for (const leave of ['open', 'reset']) {
+  test('scheduled preview timer is cleared on ' + leave, async () => {
+    const h = harness();
+    const pending = h.api.pollPreview();
+    h.requests[0].respond(200, { id: 'job-a', preview_status: 'running' });
+    await pending;
+    assert.ok(h.api.state.previewTimer);
+    if (leave === 'open') h.api.openJob(job('job-b'), false);
+    else h.api.resetWorkspace();
+    assert.equal(h.api.state.previewTimer, null);
+    await h.clock.advance(4000);
+    assert.equal(h.requests.length, 1, 'no stale timer may fetch a new job or revive an old one');
+  });
+}
+
+test('preview POST failure enables retry and double click sends only one request', async () => {
+  const h = harness();
+  const pending = h.api.requestPreview();
+  await h.api.requestPreview();
+  assert.equal(h.requests.length, 1);
+  h.requests[0].respond(503);
+  await pending;
+  assert.equal(h.api.els.previewBtn.disabled, false);
+  assert.equal(h.api.els.previewState.textContent, 'Không gửi được yêu cầu.');
+  await h.clock.advance(3000);
+  assert.equal(h.requests.length, 1, 'failed POST must not start polling');
+  const retry = h.api.requestPreview();
+  h.requests[1].respond();
+  await retry;
+  h.requests[2].respond(200, { id: 'job-a', preview_status: 'error' });
+  await tick();
+  assert.equal(h.api.els.previewBtn.disabled, false);
+  assert.equal(h.api.els.previewState.textContent, 'Tạo bản xem trước thất bại.');
+  assert.equal(h.api.state.previewTimer, null);
+});
+
+test('preview session is checked after awaiting the response body', async () => {
+  const h = harness();
+  let resolveBody;
+  const body = new Promise((resolve) => { resolveBody = resolve; });
+  const pending = h.api.pollPreview();
+  h.requests[0].respond(200, body);
+  await tick();
+  h.api.openJob(job('job-b'), false);
+  const src = h.api.els.video.src;
+  resolveBody({ id: 'job-a', preview_status: 'ready' });
+  await pending;
+  assert.equal(h.api.els.video.src, src);
+  assert.equal(h.api.state.previewTimer, null);
+});
+
+for (const action of ['bulk', 'single']) {
+  test('switch resets ' + action + ' translation button and old finally cannot release B work', async () => {
+    const h = harness();
+    const old = action === 'bulk' ? h.api.retranslateMissing()
+      : h.api.retranslateCue(0, h.api.els.retransAllBtn);
+    const oldPut = assertRequest(h, 0, 'PUT', 'cues');
+    h.api.openJob(job('job-b'), false);
+    assert.equal(h.api.els.retransAllBtn.disabled, false);
+    assert.equal(h.api.els.retransAllBtn.textContent, 'Dịch lại chỗ thiếu');
+    assert.equal(h.api.els.retransAllBtn.classList.contains('spin'), false);
+    const current = h.api.retranslateMissing();
+    assert.equal(h.api.els.retransAllBtn.disabled, true);
+    oldPut.respond();
+    await old;
+    assert.equal(h.api.state.retranslating, true);
+    assert.equal(h.api.els.retransAllBtn.disabled, true, 'old finally must not enable B busy button');
+    h.requests[1].respond(503);
+    await current;
+    assert.equal(h.api.els.retransAllBtn.disabled, false);
+  });
+}
+
+for (const outcome of ['ok', 'http', 'network']) {
+  test('late handoff cancel (' + outcome + ') cannot replace B handoff or release B cancel button', async () => {
+    const h = harness();
+    h.api.bindEvents();
+    const first = job();
+    first.stats.handoff = { id: 'handoff-a', remote_job_id: 'remote-a', status: 'running', stage: 'A working' };
+    h.api.openJob(first, false);
+    h.api.els.handoffCancelBtn.click();
+    const old = assertRequest(h, 0, 'POST', 'handoff/cancel');
+    const next = job('job-b');
+    next.stats.handoff = { id: 'handoff-b', remote_job_id: 'remote-b', status: 'running', stage: 'B working' };
+    h.api.openJob(next, false);
+    assert.equal(h.api.els.handoffCancelBtn.disabled, false);
+    h.api.els.handoffCancelBtn.click();
+    const current = h.requests[1];
+    assert.equal(current.url, '/api/jobs/job-b/handoff/cancel');
+    const handoff = h.api.state.handoff;
+    const timer = h.api.state.handoffTimer;
+    const stage = h.api.els.handoffStage.textContent;
+    const toast = h.api.els.toast.textContent;
+    if (outcome === 'network') old.reject();
+    else old.respond(outcome === 'ok' ? 200 : 503, { handoff: { id: 'handoff-a', status: 'cancelled' } });
+    await tick();
+    assert.equal(h.api.state.handoff, handoff);
+    assert.equal(h.api.state.handoffTimer, timer);
+    assert.equal(h.api.els.handoffStage.textContent, stage);
+    assert.equal(h.api.els.toast.textContent, toast);
+    assert.equal(h.api.els.handoffCancelBtn.disabled, true);
+    current.respond(200, { handoff: { id: 'handoff-b', status: 'cancelled', stage: 'B stopped' } });
+    await tick();
+    assert.equal(h.api.state.handoff.id, 'handoff-b');
+    assert.equal(h.api.els.handoffStage.textContent, 'B stopped');
+    assert.equal(h.api.els.handoffCancelBtn.disabled, false);
+  });
+}
+
+test('handoff cancel double click sends one POST and retains normal success behavior', async () => {
+  const h = harness();
+  h.api.bindEvents();
+  const result = job();
+  result.stats.handoff = { id: 'handoff-a', remote_job_id: 'remote-a', status: 'running' };
+  h.api.openJob(result, false);
+  h.api.els.handoffCancelBtn.click();
+  h.api.els.handoffCancelBtn.click();
+  assert.equal(h.requests.length, 1);
+  h.requests[0].respond(200, { handoff: { id: 'handoff-a', status: 'cancelling', stage: 'Stopping' } });
+  await tick();
+  assert.equal(h.api.state.handoff.status, 'cancelling');
+  assert.equal(h.api.els.handoffStage.textContent, 'Stopping');
+  assert.equal(h.api.els.toast.textContent, 'Đã yêu cầu Tool V1 dừng render');
+});
+
+for (const status of ['error', 'cancelled']) {
+  test('opening ' + status + ' rerun displays retained cues, translations and handoff', () => {
+    const h = harness();
+    const result = mixedJob();
+    result.status = status;
+    result.error = status === 'error' ? 'rerun failed' : '';
+    result.stats.handoff = { id: 'retained-handoff', status: 'done' };
+    h.api.openJob(result, true);
+    assert.equal(h.api.els.resultCard.classList.contains('hidden'), false);
+    assert.equal(h.api.els.cueList.querySelectorAll('.cue').length, 3);
+    assert.equal(cueField(h, 2, '.cue-trans').value, 'MANUAL C');
+    assert.deepEqual([...h.api.state.untranslated], ['cue-b']);
+    assert.equal(h.api.state.handoff.id, 'retained-handoff');
+    assert.equal(h.api.els.stageLabel.textContent, status === 'error' ? 'Lỗi' : 'Đã hủy');
+    assert.equal(h.api.state.running, false);
+  });
+
+  test('accepted rerun ending ' + status + ' reloads last-good cues before enabling export', async () => {
+    const h = harness();
+    configureStart(h);
+    h.edit('trans', 'KEEP MANUAL TRANSLATION');
+    const starting = h.api.startJob();
+    assertRequest(h, 0, 'PUT', 'cues').respond();
+    await starting;
+    assertRequest(h, 1, 'POST', 'start').respond();
+    await tick();
+    assert.equal(h.api.state.running, true);
+    assert.equal(h.api.state.cues.length, 0);
+    const finishing = h.api.onJobFinished({ id: 'job-a', status, error: status === 'error' ? 'decode failed' : '' });
+    const get = h.requests[2];
+    assert.equal(get.url, '/api/jobs/job-a');
+    assert.equal(h.api.state.resultPending, true);
+    assert.equal(await h.api.saveCues(), false);
+    await h.api.exportCues('srt');
+    assert.equal(h.requests.length, 3);
+    const retained = job('job-a', [{ id: 'cue-a', start: 1, end: 2, text: 'retained source', trans: 'KEEP MANUAL TRANSLATION' }]);
+    retained.status = status;
+    retained.params.translate_to = 'en';
+    retained.stats.handoff = { id: 'retained-handoff', status: 'running' };
+    retained.stats.untranslated_indices = [];
+    get.respond(200, retained);
+    await finishing;
+    assert.equal(h.api.state.resultPending, false);
+    assert.equal(h.api.state.running, false);
+    assert.equal(h.api.els.resultCard.classList.contains('hidden'), false);
+    assert.equal(h.api.state.cues[0].trans, 'KEEP MANUAL TRANSLATION');
+    assert.equal(cueField(h, 0, '.cue-trans').value, 'KEEP MANUAL TRANSLATION');
+    assert.equal(h.api.els.translateTo.value, 'en', 'retained result target is restored');
+    assert.equal(h.api.state.handoff.id, 'retained-handoff');
+    assert.equal(h.api.els.stageLabel.textContent, status === 'error' ? 'Lỗi' : 'Đã hủy');
+    const exporting = h.api.exportCues('srt');
+    const put = assertRequest(h, 3, 'PUT', 'cues');
+    assert.equal(put.body.cues[0].trans, 'KEEP MANUAL TRANSLATION');
+    put.respond();
+    await exporting;
+    assert.equal(h.document.downloads.length, 1);
+  });
+
+  test('failed ' + status + ' result fetch blocks empty cue PUTs', async () => {
+    const h = harness();
+    h.api.state.running = true;
+    h.api.state.cues = [];
+    const pending = h.api.onJobFinished({ id: 'job-a', status });
+    h.requests[0].respond(503);
+    await pending;
+    assert.equal(h.api.state.running, false);
+    assert.equal(h.api.state.resultPending, true);
+    assert.equal(await h.api.saveCues(), false);
+    await h.api.sendHandoff();
+    assert.equal(h.requests.length, 1);
+    assert.match(h.api.els.toast.textContent, /Tải lại trang/);
+  });
+
+  test('late ' + status + ' result cannot change a replacement editor session', async () => {
+    const h = harness();
+    const pending = h.api.onJobFinished({ id: 'job-a', status });
+    const get = h.requests[0];
+    h.api.openJob(job('job-a', [{ id: 'new-cue', start: 4, end: 5, text: 'NEW SESSION', trans: 'new manual' }]), false);
+    const cues = h.api.state.cues;
+    const label = h.api.els.stageLabel.textContent;
+    get.respond(200, mixedJob());
+    await pending;
+    assert.equal(h.api.state.cues, cues);
+    assert.equal(h.api.state.cues[0].id, 'new-cue');
+    assert.equal(h.api.els.stageLabel.textContent, label);
+    assert.equal(h.requests.length, 1);
+  });
+
+  test(status + ' without a last-good result keeps the empty result panel hidden', async () => {
+    const h = harness();
+    const pending = h.api.onJobFinished({ id: 'job-a', status });
+    h.requests[0].respond(200, { ...job('job-a', []), status });
+    await pending;
+    assert.equal(h.api.els.resultCard.classList.contains('hidden'), true);
+    assert.equal(h.api.state.resultPending, false);
+  });
+}
+
+test('pending handoff intent hides cancel and blocks resend until a remote ID is known', async () => {
+  const h = harness();
+  h.api.bindEvents();
+  const pending = { status: 'queued', remote_job_id: null, stage: 'Kiểm tra Tool V1 trước khi gửi lại.' };
+  h.api.renderHandoff(pending);
+  assert.equal(h.api.els.handoffStage.textContent, pending.stage, 'backend recovery instructions are preserved');
+  assert.equal(h.api.els.handoffBtn.textContent, 'Đang xác nhận gửi sang Tool V1…');
+  assert.equal(h.api.els.handoffBtn.disabled, true);
+  assert.equal(h.api.els.handoffCancelBtn.classList.contains('hidden'), true);
+  h.api.els.handoffCancelBtn.click();
+  await h.api.sendHandoff();
+  assert.equal(h.requests.length, 0, 'unknown intent cannot be cancelled or resent');
+  h.api.els.handoffCloseBtn.click();
+  assert.equal(h.api.state.handoff, pending, 'dismissing the panel must retain the active intent');
+  assert.equal(h.api.els.handoffBtn.disabled, true);
+  await h.api.sendHandoff();
+  assert.equal(h.requests.length, 0, 'dismissing the panel cannot bypass the resend guard');
+  h.api.renderHandoff({ ...pending, remote_job_id: 'remote-known', queue_position: 2 });
+  assert.equal(h.api.els.handoffCancelBtn.classList.contains('hidden'), false);
+  assert.equal(h.api.els.handoffBtn.textContent, 'Đang trong hàng chờ…');
+  assert.equal(h.api.els.handoffCancelBtn.textContent, 'Rút khỏi hàng chờ');
+  assert.match(h.api.els.handoffNote.textContent, /Vị trí chờ: 2/);
+  h.api.renderHandoff({ status: 'running', remote_job_id: 'remote-known' });
+  assert.equal(h.api.els.handoffCancelBtn.textContent, 'Hủy render');
+  assert.doesNotMatch(h.api.els.handoffNote.textContent, /Vị trí chờ/);
+});
+
+test('failed handoff POST reconciles durable state, recovers IDs and retains ambiguous intent if GET fails', async () => {
+  const instruction = 'Chưa xác định kết quả gửi. Kiểm tra Tool V1 trước khi gửi lại.';
+  const cases = [
+    { status: 507, record: { status: 'queued', remote_job_id: 'recovered-id', stage: 'Render recovered' } },
+    { status: 502, record: { status: 'queued', remote_job_id: null, stage: instruction } },
+    { status: 502, getFails: true },
+    { status: 'network', getFails: true },
+    { status: 400, record: null },
+    { status: 400, getFails: true },
+  ];
+  for (const scenario of cases) {
+    const h = harness();
+    const pending = h.api.sendHandoff();
+    assertRequest(h, 0, 'PUT', 'cues').respond();
+    await tick();
+    const post = assertRequest(h, 1, 'POST', 'handoff');
+    if (scenario.status === 'network') post.reject();
+    else post.respond(scenario.status, { detail: 'send outcome (' + scenario.status + ')' });
+    await tick();
+    const get = assertRequest(h, 2, 'GET', 'handoff');
+    assert.equal(h.api.els.handoffBtn.disabled, true, 'resend stays blocked while reconciling');
+    if (scenario.getFails) get.respond(503);
+    else get.respond(200, { handoff: scenario.record });
+    await pending;
+    assert.equal(h.api.state.handoffSending, false);
+    const definiteFailure = scenario.status === 400;
+    assert.equal(h.api.state.handoff.status, definiteFailure ? 'error' : 'queued');
+    assert.equal(h.api.els.handoffBtn.disabled, !definiteFailure);
+    assert.equal(h.api.els.handoffCancelBtn.classList.contains('hidden'), !scenario.record?.remote_job_id);
+    if (scenario.record) {
+      assert.equal(h.api.state.handoff, scenario.record, 'authoritative backend record wins over POST error');
+      assert.equal(h.api.els.handoffStage.textContent, scenario.record.stage);
+    } else if (!definiteFailure) {
+      assert.equal(h.api.state.handoff.remote_job_id, null);
+      assert.match(h.api.els.handoffStage.textContent, /Không gửi lại; kiểm tra Tool V1/);
+      assert.match(h.api.els.toast.textContent, /Không gửi lại; kiểm tra Tool V1/);
+    }
+    if (!definiteFailure) {
+      await h.api.sendHandoff();
+      assert.equal(h.requests.length, 3, 'pending render cannot be resent after reconciliation');
+    }
+  }
+});
+
+test('late handoff reconciliation GET cannot alter a replacement session or release its send button', async () => {
+  for (const nextId of ['job-b', 'job-a']) {
+    for (const getFails of [false, true]) {
+      const h = harness();
+      const old = h.api.sendHandoff();
+      assertRequest(h, 0, 'PUT', 'cues').respond();
+      await tick();
+      assertRequest(h, 1, 'POST', 'handoff').respond(502, { detail: 'remote timeout' });
+      await tick();
+      const oldGet = assertRequest(h, 2, 'GET', 'handoff');
+      const next = job(nextId);
+      next.stats.handoff = { status: 'done', remote_job_id: 'current-id', stage: 'Current complete' };
+      h.api.openJob(next, false);
+      const current = h.api.sendHandoff();
+      const currentPut = h.requests[3];
+      const handoff = h.api.state.handoff;
+      const label = h.api.els.handoffBtn.textContent;
+      const toast = h.api.els.toast.textContent;
+      if (getFails) oldGet.reject();
+      else oldGet.respond(200, { handoff: { status: 'queued', remote_job_id: null, stage: 'STALE INTENT' } });
+      await old;
+      assert.equal(h.api.state.handoff, handoff);
+      assert.equal(h.api.state.handoffSending, true);
+      assert.equal(h.api.els.handoffBtn.disabled, true);
+      assert.equal(h.api.els.handoffBtn.textContent, label);
+      assert.equal(h.api.els.toast.textContent, toast);
+      assert.equal(h.api.state.handoffTimer, null, 'old reconciliation cannot start a poll');
+      assert.equal(h.requests.length, 4);
+      currentPut.respond(503);
+      await current;
+    }
+  }
+});
+
+test('dashboard handshake shows authorized connection and allows navigation without sending a project', async () => {
+  const h = harness();
+  const pending = h.api.checkToolV1Connection();
+  assert.equal(h.requests[0].url, '/api/tool-v1/status');
+  assert.equal(h.requests[0].method, 'GET');
+  h.requests[0].respond(200, { ok: true, authorized: true, dashboard_url: 'http://127.0.0.1:8088/' });
+  await pending;
+  assert.equal(h.api.state.toolV1Connected, true);
+  assert.match(h.api.els.toolV1Connection.textContent, /Đã kết nối/);
+  assert.equal(h.api.els.toolV1Dashboard.href, 'http://127.0.0.1:8088/');
+  assert.equal(h.api.els.handoffBtn.disabled, false);
+  assert.equal(h.requests.length, 1, 'connection cannot import or render');
+});
+
+test('offline or unauthorized dashboard disables sending and retry restores the connection', async () => {
+  const h = harness();
+  let pending = h.api.checkToolV1Connection();
+  h.requests[0].respond(200, { ok: false, detail: '403: missing control token', dashboard_url: 'http://127.0.0.1:8088/' });
+  await pending;
+  assert.equal(h.api.els.handoffBtn.disabled, true);
+  assert.match(h.api.els.toolV1Connection.textContent, /403/);
+  await h.api.sendHandoff();
+  assert.equal(h.requests.length, 1, 'offline cannot send even via direct handler');
+  h.api.openJob(job('job-b'), false);
+  assert.equal(h.api.els.handoffBtn.disabled, true, 'switch cannot release offline guard');
+  pending = h.api.checkToolV1Connection();
+  h.requests[1].respond(200, { ok: true, authorized: true, dashboard_url: 'http://127.0.0.1:8088/' });
+  await pending;
+  assert.equal(h.api.els.handoffBtn.disabled, false);
+});
+
+test('older dashboard check cannot overwrite a newer check or release an active render', async () => {
+  const h = harness();
+  const old = h.api.checkToolV1Connection();
+  const current = h.api.checkToolV1Connection();
+  h.api.renderHandoff({ status: 'running', remote_job_id: 'remote', stem: 'project' });
+  h.requests[1].respond(200, { ok: true, authorized: true, dashboard_url: 'http://127.0.0.1:8088/' });
+  await current;
+  h.requests[0].respond(200, { ok: false, detail: 'old offline' });
+  await old;
+  assert.equal(h.api.state.toolV1Connected, true);
+  assert.match(h.api.els.toolV1Connection.textContent, /Đã kết nối/);
+  assert.equal(h.api.els.handoffBtn.disabled, true);
+  assert.equal(h.api.state.handoff.remote_job_id, 'remote');
+});
+
+test('selected blur strength is sent only after latest cue save succeeds', async () => {
+  const h = harness();
+  h.api.els.handoffBlur.value = '24';
+  h.edit('trans', 'Latest translation');
+  const pending = h.api.sendHandoff();
+  const save = assertRequest(h, 0, 'PUT', 'cues');
+  assert.equal(h.requests.length, 1);
+  save.respond(200, { ok: true });
+  await tick();
+  const send = assertRequest(h, 1, 'POST', 'handoff');
+  assert.equal(send.body.blur_radius, 24);
+  send.respond(200, { handoff: { status: 'running', remote_job_id: 'remote' } });
+  await pending;
+  assert.equal(h.api.els.handoffBtn.disabled, true);
+});
+
+test('a failed connection during cue save prevents the later render POST', async () => {
+  const h = harness();
+  h.edit('trans', 'Latest');
+  const pending = h.api.sendHandoff();
+  assertRequest(h, 0, 'PUT', 'cues');
+  const checking = h.api.checkToolV1Connection();
+  h.requests[1].respond(200, { ok: false, detail: 'connection lost' });
+  await checking;
+  h.requests[0].respond(200, { ok: true });
+  await pending;
+  assert.equal(h.requests.length, 2);
+  assert.equal(h.api.els.handoffBtn.disabled, true);
+  assert.equal(h.api.state.handoffSending, false);
 });

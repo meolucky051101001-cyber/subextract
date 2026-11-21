@@ -4,6 +4,7 @@ import json
 import shutil
 import subprocess
 import tempfile
+import threading
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -175,6 +176,8 @@ def stream_roi_frames(
     plan: StreamPlan,
     cancel_event=None,
 ) -> Iterator[tuple[float, np.ndarray]]:
+    if cancel_event is not None and cancel_event.is_set():
+        return
     ffmpeg = _need("ffmpeg")
     x, y, w, h = plan.crop
     vf = (
@@ -187,29 +190,79 @@ def stream_roi_frames(
         "-vf", vf, "-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1",
     ]
     frame_bytes = plan.out_w * plan.out_h * 3
-    err_file = tempfile.TemporaryFile()
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err_file, bufsize=frame_bytes * 4)
-    index = 0
-    try:
-        assert proc.stdout is not None
-        while True:
-            if cancel_event is not None and cancel_event.is_set():
-                break
-            buf = proc.stdout.read(frame_bytes)
-            if not buf or len(buf) < frame_bytes:
-                break
-            frame = np.frombuffer(buf, np.uint8).reshape(plan.out_h, plan.out_w, 3)
-            yield index / plan.sample_fps, frame
-            index += 1
-    finally:
-        if proc.poll() is None:
-            proc.kill()
+    with tempfile.TemporaryFile() as err_file:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err_file, bufsize=frame_bytes * 4)
+        stopped = threading.Event()
+
+        def cancelled() -> bool:
+            return cancel_event is not None and cancel_event.is_set()
+
+        def kill_running() -> None:
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass  # Exited between poll and kill.
+
+        def watch_cancel() -> None:
+            # Killing the child also unblocks a read when the decoder stalls.
+            while not stopped.wait(0.05):
+                if cancelled():
+                    kill_running()
+                    return
+
+        watcher = None
         try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            pass
-        err_file.seek(0)
-        stderr = err_file.read().decode("utf-8", errors="replace").strip()
-        err_file.close()
-        if proc.returncode not in (0, -9, None) and index == 0:
-            raise FFmpegError(stderr or f"ffmpeg thoát với mã {proc.returncode}")
+            if cancel_event is not None:
+                watcher = threading.Thread(target=watch_cancel, daemon=True)
+                watcher.start()
+            assert proc.stdout is not None
+            index = 0
+            truncated = False
+            while not cancelled():
+                buf = bytearray()
+                while len(buf) < frame_bytes and not cancelled():
+                    chunk = proc.stdout.read(frame_bytes - len(buf))
+                    if not chunk:
+                        break
+                    buf.extend(chunk)
+                if cancelled():
+                    return
+                if len(buf) < frame_bytes:
+                    truncated = bool(buf)
+                    break
+                frame = np.frombuffer(buf, np.uint8).reshape(plan.out_h, plan.out_w, 3)
+                yield index / plan.sample_fps, frame
+                index += 1
+            if cancelled():
+                return
+            # EOF can precede process exit. Wait before inspecting the code;
+            # do not kill a healthy decoder while it finishes shutting down.
+            try:
+                returncode = proc.wait(timeout=10)
+            except subprocess.TimeoutExpired as exc:
+                if cancelled():
+                    return
+                raise FFmpegError("ffmpeg không thoát sau khi kết thúc stream") from exc
+            if cancelled():
+                return
+            err_file.seek(0)
+            stderr = err_file.read(65536).decode("utf-8", errors="replace").strip()
+            if returncode != 0:
+                raise FFmpegError(stderr or f"ffmpeg thoát với mã {returncode}")
+            if truncated:
+                raise FFmpegError("ffmpeg trả về frame không đầy đủ (truncated raw frame)")
+        finally:
+            stopped.set()
+            try:
+                kill_running()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    kill_running()
+                    proc.wait()  # Reap the killed process, never leave an orphan.
+            finally:
+                if watcher is not None:
+                    watcher.join()
+                if proc.stdout is not None:
+                    proc.stdout.close()

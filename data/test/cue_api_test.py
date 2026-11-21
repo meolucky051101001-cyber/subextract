@@ -302,12 +302,13 @@ class CueApiRegression(unittest.TestCase):
         self.save.assert_not_called()
 
     def test_start_reserves_before_worker_runs_and_duplicate_start_keeps_state(self):
+        previous = self.job.cues
         with patch.object(api.threading, "Thread") as thread:
             response = self.client.post("/api/jobs/offline/start", json={})
             self.assertEqual(response.status_code, 200, response.text)
             self.assertEqual(response.json()["job"]["status"], "running")
             self.assertTrue(self.job.run_lock.locked())
-            self.assertEqual(self.job.cues, [])
+            self.assertIs(self.job.cues, previous)
             params, stats, cues = self.job.params, self.job.stats, self.job.cues
             try:
                 self.assert_error(self.client.post("/api/jobs/offline/start", json={"sample_fps": 9}), 409)
@@ -360,6 +361,7 @@ class CueApiRegression(unittest.TestCase):
         self.assertFalse(self.job.run_lock.locked())
 
     def test_rerun_while_translation_pending_rejects_late_commit(self):
+        previous = copy.deepcopy(self.job.cues)
         def translate(cues, **kwargs):
             with patch.object(api.threading, "Thread"):
                 started = api.start_job("offline", api.StartBody())
@@ -368,20 +370,23 @@ class CueApiRegression(unittest.TestCase):
         self.translation.side_effect = translate
         try:
             self.assert_error(self.post(cue_id="a"), 409)
-            self.assertEqual(self.job.cues, [])
+            self.assertEqual(self.job.cues, previous)
             self.save.assert_not_called()
         finally:
             if self.job.run_lock.locked():
                 self.job.run_lock.release()
 
     def test_worker_releases_run_lock_even_if_final_save_fails(self):
+        previous = copy.deepcopy(self.job.cues)
         self.job.run_lock.acquire()
-        self.save.side_effect = [None, OSError("disk full on final save")]
-        with patch.object(api, "run_pipeline", return_value={"cues": [cue("new")], "stats": {}}):
+        self.save.side_effect = [None, OSError("publish save failed"), OSError("final save failed")]
+        with patch.object(api, "run_pipeline", return_value={"cues": [cue("new")], "stats": {}}), patch.object(Path, "write_text"):
             with self.assertRaisesRegex(OSError, "final save"):
                 api._run_job_thread(self.job, api.RunParams())
         self.assertFalse(self.job.run_lock.locked())
-        self.assertEqual(self.job.status, "done")
+        self.assertEqual(self.job.status, "error")
+        self.assertEqual(self.job.cues, previous)
+        self.assertIn("publish save", self.job.error)
 
     def test_worker_releases_run_lock_when_initial_save_fails(self):
         self.job.run_lock.acquire()
