@@ -4,7 +4,7 @@ import math
 import re
 import unicodedata
 
-_HAN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+_HAN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0002fa1f\U00030000-\U000323af]")
 _MEANINGFUL = re.compile(r"[0-9A-Za-z\u00c0-\u1ef9\u3400-\u4dbf\u4e00-\u9fff]")
 
 # Các âm tiết/từ tiếng Việt thường gặp (so sánh KHÔNG DẤU, chữ thường) dùng để
@@ -108,8 +108,18 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
+def clean_ocr_lines(text: str, *, chinese_only: bool = False) -> list[str]:
+    """Keep digits only when their own OCR row contains Han in Chinese mode."""
+    rows = []
+    for raw in str(text).splitlines():
+        row = clean_text(raw)
+        if row and (not chinese_only or _HAN.search(row)):
+            rows.append(row)
+    return rows
+
+
 def is_meaningful(text: str) -> bool:
-    return bool(_MEANINGFUL.search(text))
+    return bool(_MEANINGFUL.search(text) or _HAN.search(text))
 
 
 def han_ratio(text: str) -> float:
@@ -167,6 +177,8 @@ def build_cues(
     min_conf: float = 0.25,
     merge_gap: float = 0.45,
     min_duration: float = 0.25,
+    *,
+    chinese_only: bool = False,
 ) -> list[dict]:
     try:
         duration = float(video_duration)
@@ -188,14 +200,14 @@ def build_cues(
     for order, group in enumerate(groups):
         lines = []
         for line in group.get("lines", []):
-            text = clean_text(line.get("text", ""))
+            texts = clean_ocr_lines(line.get("text", ""), chinese_only=chinese_only)
             try:
                 confidence = float(line.get("conf", 0.0))
             except (TypeError, ValueError):
                 continue
-            if not text or not math.isfinite(confidence) or confidence < confidence_floor or not is_meaningful(text):
+            if not math.isfinite(confidence) or confidence < confidence_floor:
                 continue
-            lines.append(text)
+            lines.extend(text for text in texts if is_meaningful(text))
         if not lines:
             continue
         try:

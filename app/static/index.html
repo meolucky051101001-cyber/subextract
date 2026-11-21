@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SubExtract Local — Bóc phụ đề hardsub</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect x='3' y='5' width='18' height='14' rx='3' fill='%2314161d' stroke='%237c5cff'/%3E%3Cpath d='M7 15h4M13 15h4' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="/static/style.css?v=20261103e">
+  <link rel="stylesheet" href="/static/style.css?v=20261120-blur">
 </head>
 <body>
   <div class="bg-glow" aria-hidden="true"></div>
@@ -92,10 +92,12 @@
 
           <label class="field-label">Ngôn ngữ phụ đề</label>
           <div class="lang-row">
-            <label class="chip"><input type="checkbox" id="langVi" checked><span>Tiếng Việt</span></label>
-            <label class="chip"><input type="checkbox" id="langEn" checked><span>English</span></label>
+            <label class="chip"><input type="checkbox" id="langVi"><span>Tiếng Việt</span></label>
+            <label class="chip"><input type="checkbox" id="langEn"><span>English</span></label>
             <label class="chip"><input type="checkbox" id="langZh" checked><span>中文</span></label>
           </div>
+
+          <p class="muted small">Chỉ chọn 中文: giữ dòng có chữ Hán và số đi cùng, bỏ số đứng riêng.</p>
 
           <label class="field-label" for="translateTo">Dịch sau OCR</label>
           <select id="translateTo">
@@ -128,7 +130,7 @@
           <label class="field-label" for="toolV1Url">Tool V1 AutoDub <span class="muted">— nhận bản dịch để lồng tiếng + che sub</span></label>
           <div class="key-row">
             <input type="text" id="toolV1Url" spellcheck="false" placeholder="http://127.0.0.1:8088">
-            <button class="btn ghost small" id="saveToolV1Btn" type="button">Lưu</button>
+            <button class="btn ghost small" id="saveToolV1Btn" type="button">Lưu &amp; kết nối</button>
           </div>
           <span id="toolV1State" class="small muted">Mặc định: http://127.0.0.1:8088</span>
 
@@ -174,11 +176,28 @@
             </select>
             <button class="btn" id="exportSrt" type="button">Tải SRT</button>
             <button class="btn ghost" id="exportVtt" type="button">Tải VTT</button>
-            <button class="btn toolv1" id="handoffBtn" type="button" title="Gửi bản dịch sang Tool V1 để lồng tiếng Việt và che phụ đề gốc">Gửi sang Tool V1 · lồng tiếng + che sub</button>
           </div>
         </div>
         <p class="hint muted small">Nhấp vào chữ để sửa nội dung gốc hoặc bản dịch — tự động lưu. <span aria-hidden="true">⟳</span> dịch lại cue bằng Gemini · nút tách/gộp dòng nằm bên phải mỗi cue · Ctrl+Z hoàn tác thao tác dòng. Nhấp ra ngoài chữ để tua video.</p>
         <div class="find-row"><input id="findInput" type="text" placeholder="Tìm trong cue…" spellcheck="false"><input id="replaceInput" type="text" placeholder="Thay bằng…" spellcheck="false"><button class="btn ghost small" id="replaceAllBtn" type="button">Thay tất cả</button><span id="findCount" class="muted small"></span></div>
+        <div class="blur-step">
+          <div class="blur-step-copy">
+            <h3>Bước 2 · Blur che phụ đề Trung</h3>
+            <p class="muted small">Tool V1 làm mờ vùng phụ đề theo khung OCR đã dùng, chèn bản dịch và lồng tiếng khi xuất video. Video lồng tiếng ở bước OCR chưa bao gồm lớp blur này.</p>
+            <span id="toolV1Connection" class="small muted" role="status">Đang kiểm tra kết nối dashboard…</span>
+          </div>
+          <div class="blur-step-actions">
+            <label class="small" for="handoffBlur">Độ mờ</label>
+            <select id="handoffBlur" aria-label="Độ mờ che phụ đề Trung">
+              <option value="10">Nhẹ</option>
+              <option value="16" selected>Vừa</option>
+              <option value="24">Mạnh</option>
+            </select>
+            <button class="btn toolv1" id="handoffBtn" type="button">Blur che sub + xuất video</button>
+            <a class="btn ghost small" id="toolV1Dashboard" href="http://127.0.0.1:8088/" target="_blank" rel="noopener noreferrer">Mở dashboard Tool V1 ↗</a>
+            <button class="btn ghost small" id="checkToolV1Btn" type="button">Kiểm tra kết nối</button>
+          </div>
+        </div>
         <p id="dubResult" class="hint muted small hidden"></p>
         <div id="handoffPanel" class="handoff hidden">
           <div class="handoff-head">
@@ -197,6 +216,6 @@
   </main>
 
   <div id="toast" class="toast hidden" role="status"></div>
-  <script src="/static/app.js?v=20261103e"></script>
+  <script src="/static/app.js?v=20261120-queue"></script>
 </body>
 </html>

@@ -20,8 +20,11 @@ from .detect import (
 )
 from .ffmpeg_io import make_multi_plan, probe_video, stream_roi_frames
 from .ocr import get_engine, prepare_line
-from .post import build_cues, clean_text, fix_ocr_text, ocr_text_key
+from .post import build_cues, clean_ocr_lines, fix_ocr_text, ocr_text_key
 from .translate import TARGET_LABELS, translate_cues
+
+
+MAX_GROUP_SECONDS = 12.0
 
 
 @dataclass
@@ -51,7 +54,9 @@ class _Group:
     region_w: int = 0
     stable: object = None
     ri: int = 0
-    spread: list = field(default_factory=list)
+    spread: list[tuple[float, np.ndarray]] = field(default_factory=list)
+    spread_step: float = 1.0
+    window_continuation: bool = False
 
 
 def _add_best(group: _Group, sharp: float, t: float, frame: np.ndarray) -> None:
@@ -65,15 +70,94 @@ def _add_best(group: _Group, sharp: float, t: float, frame: np.ndarray) -> None:
 
 
 def _add_spread(group: _Group, t: float, frame: np.ndarray) -> None:
-    # Khung phủ đều theo thời gian: dùng cho cue dài để phát hiện chữ đổi
-    # khi hộp phụ đề giữ nguyên. Bước giãn thích ứng (1s → 2s → 3s) để group
-    # dài vẫn được phủ tới cuối mà không tốn quá nhiều bộ nhớ.
-    count = len(group.spread)
-    if count >= 24:
-        return
-    step = 1.0 if count < 8 else (2.0 if count < 16 else 3.0)
-    if not group.spread or t - group.spread[-1][0] >= step:
-        group.spread.append((t, frame.copy()))
+    # Keep the first frame, regularly spaced checkpoints, and a moving tail.
+    # Compact checkpoints online instead of freezing once the buffer is full.
+    if len(group.spread) >= 24 and group.spread[-1][0] - group.spread[-2][0] >= group.spread_step:
+        group.spread = group.spread[:-1:2] + group.spread[-1:]
+        group.spread_step *= 2.0
+    sample = (t, frame.copy())
+    if len(group.spread) < 2 or group.spread[-1][0] - group.spread[-2][0] >= group.spread_step:
+        group.spread.append(sample)
+    else:
+        group.spread[-1] = sample
+
+
+def _temporal_candidates(candidates: list[dict], limit: int = 16) -> list[dict]:
+    # Best/sharp frames can duplicate spread frames or cluster near the start.
+    # Deduplicate timestamps, then retain coverage including both endpoints.
+    unique = {}
+    for candidate in candidates:
+        unique.setdefault(float(candidate.get("t", 0.0)), candidate)
+    ordered = [unique[t] for t in sorted(unique)]
+    if len(ordered) <= limit:
+        return ordered
+    indices = np.linspace(0, len(ordered) - 1, limit).round().astype(int)
+    return [ordered[int(index)] for index in indices]
+
+
+def _same_line_position(a: tuple, b: tuple) -> bool:
+    width = min(a[2] - a[0], b[2] - b[0])
+    height = min(a[3] - a[1], b[3] - b[1])
+    overlap_x = min(a[2], b[2]) - max(a[0], b[0])
+    overlap_y = min(a[3], b[3]) - max(a[1], b[1])
+    return width > 0 and height > 0 and overlap_x >= 0.5 * width and overlap_y >= 0.6 * height
+
+
+def _filter_static_lines(groups: list[dict], duration: float, min_conf: float, interval: float) -> None:
+    # A repeated reply is not a watermark. Require the same text AND box in
+    # one ROI, continuously present for almost the entire video, alongside
+    # changing text. The visual static mask remains the primary logo filter.
+    regions: dict[int, list[dict]] = defaultdict(list)
+    for group in groups:
+        regions[group["region"]].append(group)
+    for region_groups in regions.values():
+        if len(region_groups) < 12:
+            continue
+        occurrences = defaultdict(list)
+        neighbours = defaultdict(list)
+        for group in region_groups:
+            seen = {(line["text"].casefold(), tuple(line["box"]))
+                    for line in group["lines"]
+                    if line["conf"] >= min_conf and "box" in line}
+            for key in seen:
+                occurrences[key].append((float(group["start"]), float(group["end"])))
+                x1, y1, x2, y2 = key[1]
+                for text, box in seen:
+                    separate = box[2] <= x1 or box[0] >= x2 or box[3] <= y1 or box[1] >= y2
+                    if text != key[0] and separate:
+                        # Dialogue widths change with their text. Match the
+                        # same line by overlap, while keeping columns apart.
+                        track = next((texts for ref, texts in neighbours[key]
+                                      if _same_line_position(ref, box)), None)
+                        if track is None:
+                            neighbours[key].append((box, {text}))
+                        else:
+                            track.add(text)
+        static = set()
+        for key, spans in occurrences.items():
+            # Sequential replies at the same subtitle position are not a
+            # changing neighbour: both lines must have been present together.
+            changing_neighbour = any(len(texts) >= 2 for _box, texts in neighbours[key])
+            if len(spans) < max(6, 0.9 * len(region_groups)) or not changing_neighbour:
+                continue
+            spans.sort()
+            start, end = spans[0]
+            covered = end - start
+            longest = 0.0
+            run_start = start
+            gap_limit = min(0.25, interval * 1.1)
+            for start, stop in spans[1:]:
+                if start > end + gap_limit:
+                    longest = max(longest, end - run_start)
+                    run_start = start
+                covered += max(0.0, stop - max(start, end))
+                end = max(end, stop)
+            longest = max(longest, end - run_start)
+            if covered >= 0.9 * duration and longest >= 0.9 * duration:
+                static.add(key)
+        for group in region_groups:
+            group["lines"] = [line for line in group["lines"]
+                              if (line["text"].casefold(), tuple(line.get("box", ()))) not in static]
 
 
 def _same_text(a: tuple, b: tuple) -> bool:
@@ -136,12 +220,23 @@ def run_pipeline(
 
     def close_group(group: _Group, end: float) -> None:
         end = min(float(info.duration), float(end))
+        merge_into = None
+        index = len(groups_meta)
         if end - group.start < 0.3:
-            return
+            if not group.window_continuation:
+                return
+            # An artificial split must not discard its short continuation at
+            # EOF or at the next detector change. OCR it with the prior window
+            # so equal text can merge before minimum-duration handling.
+            previous = next((i for i in range(len(groups_meta) - 1, -1, -1)
+                             if groups_meta[i]["region"] == group.ri), None)
+            if previous is None or abs(groups_meta[previous]["end"] - group.start) > 1e-6:
+                return
+            index = previous
+            merge_into = groups_meta[previous]
         min_line_h = max(12.0, group.region_w * 0.013)
         candidates = []
-        index = len(groups_meta)
-        slot = 0
+        slot = len(merge_into["candidates"]) if merge_into is not None else 0
         for _sharp, frame_t, frame in group.best:
             det = detect_text(frame, stable=group.stable)
             if not det.boxes:
@@ -179,8 +274,12 @@ def run_pipeline(
                 candidates.append({"path": str(path), "boxes": det.boxes, "t": frame_t})
                 slot += 1
         if candidates:
-            groups_meta.append({"start": group.start, "end": end, "candidates": candidates,
-                                "region": group.ri})
+            if merge_into is not None:
+                merge_into["end"] = end
+                merge_into["candidates"].extend(candidates)
+            else:
+                groups_meta.append({"start": group.start, "end": end, "candidates": candidates,
+                                    "region": group.ri})
 
     def feed_region(ri: int, t: float, det, sub_frame: np.ndarray) -> None:
         cur = curs[ri]
@@ -192,15 +291,20 @@ def run_pipeline(
                 )
                 _add_best(curs[ri], det.sharp, t, sub_frame)
                 _add_spread(curs[ri], t, sub_frame)
-            elif same_state(cur.ref, det):
+            elif t - cur.start < MAX_GROUP_SECONDS and same_state(cur.ref, det):
                 cur.last_t = t
                 _add_best(cur, det.sharp, t, sub_frame)
                 _add_spread(cur, t, sub_frame)
             else:
+                # Bound OCR spacing even when detector geometry never changes.
+                # The boundary frame starts the next window; build_cues merges
+                # adjacent windows again when their recognized text is equal.
+                window_continuation = t - cur.start >= MAX_GROUP_SECONDS
                 close_group(cur, t)
                 curs[ri] = _Group(
                     start=t, ref=det, last_t=t, best=[],
                     region_w=regions[ri][2], stable=stable_regions[ri], ri=ri,
+                    window_continuation=window_continuation,
                 )
                 _add_best(curs[ri], det.sharp, t, sub_frame)
                 _add_spread(curs[ri], t, sub_frame)
@@ -309,8 +413,7 @@ def run_pipeline(
             long_cue = duration > 4.0
             if long_cue:
                 # Cue dài: OCR đủ các khung phủ thời gian rồi tách theo lúc chữ đổi.
-                candidates.sort(key=lambda c: c.get("t", 0.0))
-                candidates = candidates[:16]
+                candidates = _temporal_candidates(candidates)
             else:
                 candidates = candidates[:4]
             reads: list[tuple[float, list[dict], float]] = []
@@ -325,7 +428,9 @@ def run_pipeline(
                     if crop.size == 0:
                         continue
                     text, conf, _reader = engine.read_line(crop)
-                    text = fix_ocr_text(clean_text(text))
+                    text = "\n".join(fix_ocr_text(row) for row in clean_ocr_lines(
+                        text, chinese_only=set(params.langs) == {"zh"},
+                    ))
                     if not text:
                         continue
                     lines.append({
@@ -333,6 +438,7 @@ def run_pipeline(
                         "conf": conf,
                         "y": box[1],
                         "ny": round(box[1] / max(1, plan.out_h), 1),
+                        "box": tuple(box),
                     })
                 lines.sort(key=lambda line: line["y"])
                 score = _mean_conf(lines)
@@ -371,23 +477,7 @@ def run_pipeline(
                 f"OCR {index + 1}/{total} đoạn…",
             )
 
-        # Loại các dòng chữ tĩnh lặp lại ở gần như mọi cue (logo/kênh truyền hình).
-        if len(ocr_groups) >= 12:
-            counts: dict[tuple[str, float], int] = defaultdict(int)
-            for group in ocr_groups:
-                seen = {
-                    (line["text"].lower(), line["ny"])
-                    for line in group["lines"]
-                    if line["conf"] >= params.min_conf
-                }
-                for key in seen:
-                    counts[key] += 1
-            threshold = max(6, int(0.45 * len(ocr_groups)))
-            for group in ocr_groups:
-                group["lines"] = [
-                    line for line in group["lines"]
-                    if counts.get((line["text"].lower(), line["ny"]), 0) < threshold
-                ]
+        _filter_static_lines(ocr_groups, info.duration, params.min_conf, interval)
 
         cues = build_cues(
             ocr_groups,
@@ -395,6 +485,7 @@ def run_pipeline(
             min_conf=params.min_conf,
             merge_gap=params.merge_gap,
             min_duration=params.min_duration,
+            chinese_only=set(params.langs) == {"zh"},
         )
         ocr_seconds = time.time() - ocr_started
 
@@ -513,7 +604,7 @@ def run_pipeline(
             "translate_model_used": translate_model_used,
             "translate_fallback_from": translate_fallback_from,
             "untranslated_cues": len(untranslated_indices),
-            "untranslated_indices": untranslated_indices[:200],
+            "untranslated_indices": untranslated_indices,
             "dub_enabled": bool(params.dub),
             "dub_voice": params.dub_voice if params.dub else "",
             "dub_voice_label": params.dub_voice_label if params.dub else "",

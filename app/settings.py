@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
+import threading
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 SETTINGS_PATH = Path(os.environ.get("SUBEXTRACT_SETTINGS") or BASE_DIR / "data" / "settings.json")
+_settings_lock = threading.Lock()
 
 
 def load_settings() -> dict:
@@ -17,16 +20,31 @@ def load_settings() -> dict:
 
 
 def save_settings(updates: dict) -> None:
-    data = load_settings()
-    data.update({key: value for key, value in updates.items() if value is not None})
-    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = SETTINGS_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, SETTINGS_PATH)
-    try:
-        os.chmod(SETTINGS_PATH, 0o600)
-    except OSError:
-        pass
+    # Hold the lock across the read as well as the replacement so independent
+    # request fields merge against the latest committed settings.
+    with _settings_lock:
+        data = load_settings()
+        data.update({key: value for key, value in updates.items() if value is not None})
+        content = json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False)
+        SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=SETTINGS_PATH.parent,
+                prefix=f".{SETTINGS_PATH.name}-", suffix=".tmp", delete=False,
+            ) as output:
+                temporary = Path(output.name)
+                output.write(content)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, SETTINGS_PATH)
+            try:
+                os.chmod(SETTINGS_PATH, 0o600)
+            except OSError:
+                pass
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
 
 def get_gemini_keys() -> list[str]:

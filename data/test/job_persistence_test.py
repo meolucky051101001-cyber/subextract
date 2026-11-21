@@ -48,6 +48,25 @@ class JobPersistenceRegression(unittest.TestCase):
             self.job.save()
         self.assert_original_survived()
 
+    def test_nonfinite_numbers_never_replace_valid_metadata(self):
+        for value in (float("nan"), float("inf"), float("-inf")):
+            for field in ("cues", "stats", "info", "params", "created_at"):
+                with self.subTest(value=value, field=field):
+                    original = getattr(self.job, field)
+                    if field == "cues":
+                        invalid = [{"start": 0, "end": value, "text": "invalid"}]
+                    elif field == "created_at":
+                        invalid = value
+                    else:
+                        invalid = {"nested": [{"number": value}]}
+                    setattr(self.job, field, invalid)
+                    try:
+                        with self.assertRaises(ValueError):
+                            self.job.save()
+                        self.assert_original_survived()
+                    finally:
+                        setattr(self.job, field, original)
+
     def test_replace_failure_keeps_original_and_removes_temporary(self):
         self.job.message = "new contents"
         with patch("app.jobs.os.replace", side_effect=OSError("replace failed")):
